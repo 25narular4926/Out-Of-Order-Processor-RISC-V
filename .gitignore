@@ -1,6 +1,8 @@
 ### Project Specific
 test_run_dir/*
 generated/
+build/
+chiselsim/
 
 ### SBT
 target/

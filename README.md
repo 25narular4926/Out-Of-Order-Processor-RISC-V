@@ -61,9 +61,34 @@ src/test/scala/RISCV/       ChiselSim + ScalaTest specs (per-module + whole-core
 
 ```bash
 sbt compile      # elaborate
-sbt test         # run the ChiselSim test suite
+sbt test         # run the ChiselSim test suite (needs Verilator + a Unix-like env, e.g. WSL/Linux CI)
 sbt "runMain RISCV.Main"   # emit SystemVerilog into generated/
 ```
+
+Status: `sbt compile` and `runMain RISCV.Main` (full-SoC elaboration) pass; the ChiselSim suite
+(30 tests across Decode/Rename/Frontend, ALU/MULDIV/PRF, ROB/LSU, and a whole-core smoke test)
+passes under Verilator. ChiselSim shells out to a Unix `which`, so run the tests under WSL or
+Linux CI, not a native Windows shell.
+
+## Known limitations (first pass)
+
+These are deliberate simplifications for the initial bring-up, not bugs:
+
+- **Branch predictor doesn't learn yet.** The gshare/BTB/RAS update port isn't routed through
+  the fixed `Frontend` IO, and `WbPort` carries no resolved `pc`, so the predictor effectively
+  predicts not-taken. Every taken branch mispredicts and recovers **correctly** at commit — this
+  is a performance gap, not a correctness one. (Fix: add a predictor-update channel + `WbPort.pc`.)
+- **Recovery is commit-time full-flush**, not branch-mask fast recovery. Correct and simple; a
+  mispredicted branch drains to the ROB head before the redirect fires. (Milestone 5.)
+- **Sub-word stores are word-granular.** `SW`/`LW` are exact; `SB`/`SH` splice over a zero base
+  word rather than a true read-modify-write of the single memory port, so they're fully correct
+  only when the untouched lanes are zero or are also written.
+- **VGA-region reads** aren't supported by `Memory` port 2 (the framebuffer is CPU-write-only).
+- **One MUL/DIV unit** (mul and div serialize) and a single in-flight load (one MSHR).
+- **`MainSpec` is a smoke test** (no architectural assertions) because the core has no
+  commit-trace/debug readout port yet. Self-checking against a golden RV32IM model is milestone 1.
+
+## Milestone plan
 
 ## Milestone plan
 

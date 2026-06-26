@@ -3,15 +3,17 @@ package RISCV
 import chisel3._
 import chisel3.util._
 
-object InstructionFormat extends ChiselEnum {
-    val R, I, S, B, U, J = Value
-}
-
 /**
  * Pure combinational instruction-field + immediate extractor (RV32I).
- * Splits a 32-bit instruction into rs1/rs2/rd/opcode/func3/func7, picks the format from the
- * opcode, and assembles the correctly sign-extended 32-bit immediate for each format.
- * (Ported unchanged from the in-order RISC-V project.)
+ * Splits a 32-bit instruction into rs1/rs2/rd/opcode/func3/func7 and assembles the correctly
+ * sign-extended 32-bit immediate for the instruction's format.
+ *
+ * NOTE on the immediate selection: we select the immediate with a direct nested `Mux` keyed on
+ * the opcode (every arm is a 32-bit value) rather than an intermediate format-enum `switch`.
+ * The enum-`switch` form makes firtool emit a packed-array select (`_GEN[formatCode]`), which
+ * trips Verilator's WIDTHEXPAND lint (fatal by default) on the 3-bit index. The Mux form lowers
+ * to plain nested ternaries of equal-width operands and is lint-clean. Decode semantics are
+ * identical to the classic R/I/S/B/U/J split.
  */
 class Decoder() extends Module {
     val io = IO(new Bundle {
@@ -25,50 +27,38 @@ class Decoder() extends Module {
         val func7 = Output(UInt(7.W))
     })
 
-    io.rs1 := io.instruction(19, 15)
-    io.rs2 := io.instruction(24, 20)
-    io.rd := io.instruction(11, 7)
+    val instr = io.instruction
 
-    val format = Wire(InstructionFormat())
-    format := InstructionFormat.R
+    io.rs1 := instr(19, 15)
+    io.rs2 := instr(24, 20)
+    io.rd := instr(11, 7)
+    io.opcode := instr(6, 0)
+    io.func3 := instr(14, 12)
+    io.func7 := instr(31, 25)
 
-    io.opcode := io.instruction(6, 0)
-    io.func3 := io.instruction(14, 12)
-    io.func7 := io.instruction(31, 25)
+    // The five RISC-V immediate encodings, each EXACTLY 32 bits (sign-extended). Keeping every
+    // arm at 32 bits is what keeps the Mux below lint-clean (no WIDTHTRUNC/WIDTHEXPAND).
+    val iImm = Fill(20, instr(31)) ## instr(31, 20) // 20 + 12 = 32
+    val sImm = Fill(20, instr(31)) ## instr(31, 25) ## instr(11, 7) // 20 + 7 + 5 = 32
+    val bImm = Fill(20, instr(31)) ## instr(7) ## instr(30, 25) ## instr(11, 8) ## 0.U(1.W) // 20+1+6+4+1 = 32
+    val uImm = instr(31, 12) ## 0.U(12.W) // 20 + 12 = 32
+    val jImm = Fill(12, instr(31)) ## instr(19, 12) ## instr(20) ## instr(30, 21) ## 0.U(1.W) // 12+8+1+10+1 = 32
 
-    switch(io.opcode) {
-        is(0b0110111.U) { format := InstructionFormat.U } // lui
-        is(0b0010111.U) { format := InstructionFormat.U } // auipc
-        is(0b0010011.U) { format := InstructionFormat.I } // addi, slti, ... (OP-IMM)
-        is(0b0110011.U) { format := InstructionFormat.R } // add, sub, ... (OP)
-        is(0b0001111.U) { format := InstructionFormat.I } // fence
-        is(0b1110011.U) { format := InstructionFormat.S } // system (ecall/ebreak...) -> S-ish
-        is(0b0000011.U) { format := InstructionFormat.I } // loads
-        is(0b0100011.U) { format := InstructionFormat.S } // stores
-        is(0b1101111.U) { format := InstructionFormat.J } // jal
-        is(0b1100111.U) { format := InstructionFormat.I } // jalr
-        is(0b1100011.U) { format := InstructionFormat.B } // branches
-    }
+    val opcode = io.opcode
 
-    io.immediate := 0.U
+    // Format classification by opcode (R-type and anything unmatched carry no immediate => 0).
+    val isU = opcode === "b0110111".U || opcode === "b0010111".U // lui, auipc
+    val isJ = opcode === "b1101111".U // jal
+    val isB = opcode === "b1100011".U // branches
+    val isS = opcode === "b0100011".U || opcode === "b1110011".U // store, system (S-shaped)
+    val isI = opcode === "b0010011".U || // op-imm
+        opcode === "b0000011".U || // loads
+        opcode === "b1100111".U || // jalr
+        opcode === "b0001111".U // fence
 
-    switch(format) {
-        is(InstructionFormat.I) {
-            io.immediate := Fill(21, io.instruction(31, 31)) ## io.instruction(30, 20)
-        }
-        is(InstructionFormat.S) {
-            io.immediate := Fill(21, io.instruction(31, 31)) ## io.instruction(31, 25) ## io.instruction(11, 7)
-        }
-        is(InstructionFormat.B) {
-            io.immediate := Fill(20, io.instruction(31, 31)) ## io.instruction(7, 7) ## io.instruction(31, 25) ##
-                io.instruction(11, 8) ## 0.U(1.W)
-        }
-        is(InstructionFormat.U) {
-            io.immediate := io.instruction(31, 12) ## 0.U(12.W)
-        }
-        is(InstructionFormat.J) {
-            io.immediate := Fill(12, io.instruction(31, 31)) ## io.instruction(19, 12) ## io.instruction(20, 20) ##
-                io.instruction(30, 21) ## 0.U(1.W)
-        }
-    }
+    io.immediate := Mux(
+      isU,
+      uImm,
+      Mux(isJ, jImm, Mux(isB, bImm, Mux(isS, sImm, Mux(isI, iImm, 0.U(32.W)))))
+    )
 }
