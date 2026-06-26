@@ -1,0 +1,35 @@
+### Project Specific
+test_run_dir/*
+generated/
+
+### SBT
+target/
+lib_managed/
+src_managed/
+project/boot/
+project/target/
+.history
+.cache
+
+### Scala / Metals / Bloop
+*.class
+*.log
+/.bsp
+.metals/
+.bloop/
+.scala_dependencies
+.worksheet
+
+### IDE
+.idea/
+*.iml
+.vscode/
+
+### OS
+.DS_Store
+Thumbs.db
+
+### Sim dumps
+*.vcd
+*.fst
+obj_dir/
