@@ -16,9 +16,6 @@ import scala.io.Source
  * -- tandem-comparing committed writes against a golden RV32IM reference model -- is milestone 1
  * of the bring-up plan in the README. (See also: add a debug commit-trace port to ReorderBuffer.)
  *
- * NOTE: ChiselSim uses a Verilator backend, which requires a Unix-like environment (it shells
- * out to `which verilator`). It runs in CI (Ubuntu + Verilator); it will NOT run on a native
- * Windows shell.
  */
 class MainSpec extends AnyFreeSpec with Matchers with ChiselSim {
     "Main runs test_basic.hex without crashing (smoke test)" in {

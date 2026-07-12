@@ -24,12 +24,13 @@ import chisel3.util._
  * ===================================================================================
  * FIRST-PASS SIMPLIFICATIONS (documented; correctness-first, performance-later):
  *
- *  (S1) WORD-GRANULAR memory model. Memory is word-addressed (Memory.scala). We implement:
- *         - SW  (func3=010): full word store at commit.
- *         - SB/SH via read-modify-write at commit (read current word, splice bytes, write).
+ *  (S1) WORD-ADDRESSED memory with PER-BYTE WRITE ENABLES (Memory.scala). We implement:
+ *         - SW (func3=010): full word store at commit, mask 1111.
+ *         - SB/SH: store at commit with only the touched byte lanes enabled. The SRAM preserves
+ *           the untouched bytes, so NO read-modify-write is required and all sizes are EXACT.
  *         - LW  (func3=010): full word load.
  *         - LB/LH/LBU/LHU: byte/halfword extraction from the loaded word with sign/zero ext,
- *           selected by func3 and the low address bits. (Best-effort; see (S3).)
+ *           selected by func3 and the low address bits.
  *
  *  (S2) AGE COMPARISON uses robIdx made monotonic against the current ROB head, so a younger
  *       instruction always compares "greater" within the in-flight window (window <= robEntries
@@ -41,14 +42,13 @@ import chisel3.util._
  *       single cycle without using the memory port. This is simple and deadlock-free for a
  *       1-wide machine; widening would need multiple MSHRs.
  *
- *  (S4) STORE->LOAD FORWARDING is WORD-EXACT only: a load forwards from the youngest older
- *       store whose word address matches AND whose addr+data are known. Partial overlaps
- *       (e.g. an SB followed by an overlapping LW) are NOT specially handled beyond the
- *       word-RMW the store will eventually perform; in the conservative ordering a load that
- *       cannot safely forward simply stalls until older stores resolve, so we never read stale
- *       data -- but a sub-word store that has not yet committed is forwarded as its full
- *       (RMW-merged) word value, which is correct because the STQ holds the post-RMW word once
- *       the byte splice is computed. We compute the splice at forward time. See `forwardWord`.
+ *  (S4) STORE->LOAD FORWARDING is COVERAGE-CHECKED: a load forwards from the youngest older
+ *       store whose word address matches, whose addr+data are known, AND whose byte lanes cover
+ *       every lane the load consumes. A partial overlap (e.g. an SB followed by an overlapping
+ *       LW) cannot be satisfied, because the load's remaining bytes live in memory and we cannot
+ *       read memory and forward in the same cycle. Such a load is simply not accepted and is
+ *       retried by the IssueQueue; this is deadlock-free because the blocking store is older and
+ *       therefore retires first, after which the load reads the correct memory word.
  *
  *  (S5) SINGLE MEMORY PORT arbitration: commit-store writes ALWAYS win over load reads. If a
  *       commit store and a load both want the port in the same cycle, the load is stalled
@@ -90,6 +90,7 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
         val memRead      = Output(Bool())
         val memWrite     = Output(Bool())
         val memWriteData = Output(UInt(p.xlen.W))
+        val memWriteMask = Output(UInt(4.W))      // byte enables; bit i writes byte lane i
         val memReadData  = Input(UInt(p.xlen.W))
     })
 
@@ -158,28 +159,44 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
      *  Smaller key == older. Valid because the in-flight window <= robEntries, so no aliasing. */
     def ageKey(robIdx: UInt): UInt = robIdx - io.robHeadIdx
 
-    /** Splice the store's raw rs2 data into `oldWord` for the byte/half/word size, producing
-     *  the post-RMW word that will be written to memory (and forwarded). */
-    def spliceStore(oldWord: UInt, raw: UInt, func3: UInt, byteOff: UInt): UInt = {
-        val res = WireDefault(oldWord)
+    /** Which byte lanes a store of size `func3` at `byteOff` actually writes.
+     *  SB -> one lane, SH -> two lanes, SW -> all four. Drives the memory byte-enables, so the
+     *  bytes NOT selected are left untouched in the SRAM (no read-modify-write needed). */
+    def storeMask(func3: UInt, byteOff: UInt): UInt = {
+        val m = WireDefault("b1111".U(4.W))
         switch(func3) {
-            is("b010".U) { // SW
-                res := raw
-            }
-            is("b000".U) { // SB : replace one byte at byteOff
-                val shift = (byteOff << 3.U)(4, 0)            // 0,8,16,24
-                val mask  = ("hFF".U(p.xlen.W) << shift)(p.xlen - 1, 0)
-                val ins   = ((raw & "hFF".U) << shift)(p.xlen - 1, 0)
-                res := (oldWord & ~mask) | ins
-            }
-            is("b001".U) { // SH : replace one halfword at byteOff (bit 1 selects half)
-                val shift = (byteOff(1) << 4.U).asUInt          // 0 or 16
-                val mask  = ("hFFFF".U(p.xlen.W) << shift)(p.xlen - 1, 0)
-                val ins   = ((raw & "hFFFF".U) << shift)(p.xlen - 1, 0)
-                res := (oldWord & ~mask) | ins
-            }
+            is("b000".U) { m := (1.U(4.W) << byteOff)(3, 0) }            // SB
+            is("b001".U) { m := Mux(byteOff(1), "b1100".U, "b0011".U) }  // SH
+            is("b010".U) { m := "b1111".U }                              // SW
         }
-        res
+        m
+    }
+
+    /** Position the store's raw rs2 data into its byte lanes within the 32-bit word. Lanes that
+     *  the mask does not select carry don't-care bits (memory ignores them). */
+    def storeData(raw: UInt, func3: UInt, byteOff: UInt): UInt = {
+        val shift = (byteOff << 3.U)(4, 0) // 0, 8, 16, 24
+        val d = WireDefault(raw)
+        switch(func3) {
+            is("b000".U) { d := ((raw & "hFF".U) << shift)(p.xlen - 1, 0) }   // SB
+            is("b001".U) { d := ((raw & "hFFFF".U) << shift)(p.xlen - 1, 0) } // SH
+            is("b010".U) { d := raw }                                          // SW
+        }
+        d
+    }
+
+    /** Which byte lanes a load of size `func3` at `byteOff` actually consumes. Used to decide
+     *  whether an older store fully covers the load (and may therefore be forwarded). */
+    def loadMask(func3: UInt, byteOff: UInt): UInt = {
+        val m = WireDefault("b1111".U(4.W))
+        switch(func3) {
+            is("b000".U) { m := (1.U(4.W) << byteOff)(3, 0) }            // LB
+            is("b100".U) { m := (1.U(4.W) << byteOff)(3, 0) }            // LBU
+            is("b001".U) { m := Mux(byteOff(1), "b1100".U, "b0011".U) }  // LH
+            is("b101".U) { m := Mux(byteOff(1), "b1100".U, "b0011".U) }  // LHU
+            is("b010".U) { m := "b1111".U }                              // LW
+        }
+        m
     }
 
     /** Format a loaded word into the destination value per func3 + byte offset (LB/LH/LW + U). */
@@ -240,24 +257,11 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
     // =====================================================================================
     // Commit-time STORE drain (highest memory-port priority)
     // =====================================================================================
-    // The ROB broadcasts commit; when the committing instruction is the store at the STQ head
-    // we drive the memory write. Sub-word stores need read-modify-write, but the STQ entry
-    // already holds the RAW rs2 data + func3; we can only splice against the CURRENT memory
-    // word. Memory is 1-cycle SyncReadMem, so a true RMW would need a read cycle first.
-    //
-    // FIRST-PASS RMW HANDLING: at issue time we DO NOT have the old word, so for SB/SH we
-    // perform the splice at COMMIT using a two-step micro-sequence is avoided for simplicity;
-    // instead we read the word, splice, and write across two commit cycles ONLY if needed.
-    // To keep the commit path single-cycle and deadlock-free in this first pass, we take the
-    // pragmatic route: SW writes the full word directly; SB/SH also write a full word in which
-    // the non-target bytes are taken from the most recent KNOWN value. Because we cannot read
-    // memory and write in the same cycle on a single port, we approximate the old word as 0 for
-    // the untouched lanes of a sub-word store that has no younger overlapping store in the STQ.
-    //
-    // *** This means SB/SH are only fully correct when the surrounding bytes are 0 or are also
-    //     written. This is the documented (S1)/(S4) simplification. SW is exact. ***
-    //
-    // The store drain pops the STQ head regardless of size.
+    // The ROB broadcasts commit; when the committing instruction is the store at the STQ head we
+    // drive the memory write. Sub-word stores need NO read-modify-write: the memory has per-byte
+    // write enables, so SB/SH simply assert the lanes they touch and the SRAM preserves the rest.
+    // The commit path therefore stays single-cycle for every store size, and SB/SH/SW are all
+    // exact. The store drain pops the STQ head regardless of size.
     val stHead       = stq(stqHeadIdx)
     val commitIsHead = io.commit.valid && io.commit.isStore && !stqEmpty &&
                        (stHead.robIdx === io.commit.robIdx) && stHead.valid
@@ -265,8 +269,8 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
     // it could retire); guard anyway so we never write a garbage address.
     val doStoreDrain = commitIsHead && stHead.addrValid && stHead.dataValid
 
-    // For SB/SH the post-RMW word splices raw data into a base word of 0 (documented approx).
-    val storeWord = spliceStore(0.U(p.xlen.W), stHead.data, stHead.func3, stHead.byteOff)
+    val storeWord     = storeData(stHead.data, stHead.func3, stHead.byteOff)
+    val storeMaskBits = storeMask(stHead.func3, stHead.byteOff)
 
     when(doStoreDrain) {
         // pop the store head
@@ -324,11 +328,18 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
         hit && (ageKey(s.robIdx) === fwdSelAge)
     })
     val fwdStore   = Mux1H(fwdSelOH, stq)
-    // The forwarded word is the store's post-RMW word spliced over... we do not have the
-    // underlying memory word here, so for a full-word (SW) forward we use the data directly;
-    // for a sub-word forward we splice over 0 (documented (S4) approximation, matching the
-    // commit-drain approximation so forwarding and the eventual memory state agree).
-    val forwardWord = spliceStore(0.U(p.xlen.W), fwdStore.data, fwdStore.func3, fwdStore.byteOff)
+    val forwardWord = storeData(fwdStore.data, fwdStore.func3, fwdStore.byteOff)
+
+    // COVERAGE RULE: we may only forward if the selected store writes EVERY byte lane the load
+    // consumes. The store's un-written lanes live in memory, and we cannot read memory and
+    // forward in the same cycle, so a partial overlap (e.g. an SB followed by an overlapping LW)
+    // cannot be satisfied. In that case the load simply does NOT proceed: it is not accepted and
+    // the IssueQueue retries it. This is deadlock-free because the blocking store is OLDER, so
+    // it retires first; once it drains, its STQ entry clears, the hit disappears, and the load
+    // reads the now-correct memory word.
+    val reqLoadMask  = loadMask(reqUop.func3, reqByteOff)
+    val fwdStoreMask = storeMask(fwdStore.func3, fwdStore.byteOff)
+    val fwdCovers    = (reqLoadMask & ~fwdStoreMask) === 0.U
 
     // (c) MMIO-at-head: an MMIO load must wait until it is the ROB head, then execute once.
     val loadIsHead = reqUop.robIdx === io.robHeadIdx
@@ -344,19 +355,29 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
     //  - blocked  : cannot proceed (older unknown store, MMIO not at head, port busy, pipe busy)
     //  - forward  : completes THIS cycle via CDB, no memory access, no stage-2 needed
     //  - memread  : drives memRead this cycle; result written back next cycle from stage 2
-    val loadCanForward = reqIsLoad && !olderUnknownStore && !mmioBlocked && anyFwd
+    // A load forwards only when an older store to the same word covers all of its bytes; it goes
+    // to memory only when NO older store hits the word at all. A partial (uncoverable) overlap
+    // leaves both false, so the load is not accepted and retries until the store commits.
+    val loadCanForward = reqIsLoad && !olderUnknownStore && !mmioBlocked && anyFwd && fwdCovers
     val loadNeedsMem   = reqIsLoad && !olderUnknownStore && !mmioBlocked && !anyFwd
     val loadMemGo      = loadNeedsMem && portFreeForLoad && ld2Free
 
     // =====================================================================================
     // Decoupled handshake: when do we accept `req`?
     // =====================================================================================
-    //  - a store issue is always accepted (it only writes its STQ slot; no structural hazard).
-    //  - a forwarding load is accepted (completes same cycle).
+    //  - a store issue is accepted whenever it can report completion on the CDB (see below).
+    //  - a forwarding load is accepted (completes same cycle) if the CDB is free.
     //  - a memory load is accepted only when it actually launches the read (loadMemGo).
     //  - anything blocked is NOT accepted (back-pressure; IssueQueue will retry).
-    io.req.ready := Mux(reqIsStore, true.B,
-                     Mux(reqIsLoad, loadCanForward || loadMemGo,
+    //
+    // The LSU has exactly ONE writeback port, and a stage-2 load result MUST take it (it is
+    // already in flight and would otherwise be lost). So when stage 2 is presenting a result,
+    // no new store or forwarding load may be accepted this cycle.
+    // (loadMemGo already implies !ld2Valid, because launching a read requires ld2Free.)
+    val wbPortBusy = ld2Valid
+
+    io.req.ready := Mux(reqIsStore, !wbPortBusy,
+                     Mux(reqIsLoad, (loadCanForward && !wbPortBusy) || loadMemGo,
                        true.B)) // non-mem uops should never be routed here; accept defensively.
     val reqFire = io.req.valid && io.req.ready
 
@@ -375,6 +396,8 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
     // =====================================================================================
     io.memWrite     := doStoreDrain
     io.memWriteData := storeWord
+    // byte enables: only the lanes this store actually writes (0 when not draining).
+    io.memWriteMask := Mux(doStoreDrain, storeMaskBits, 0.U(4.W))
     // address: store drain uses the store-head word address; otherwise a launching load read.
     io.memAddr := Mux(doStoreDrain, stHead.wordAddr, reqWordAddr)
     io.memRead := reqFire && loadMemGo
@@ -382,29 +405,40 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
     // =====================================================================================
     // Writeback (CDB) of the LOAD result
     // =====================================================================================
+    // Exactly ONE of these may drive the single writeback port in a cycle. The handshake above
+    // guarantees that by refusing new work while stage 2 is presenting a result, but we also
+    // encode the priority explicitly so the port can never be double-driven.
     val wb = WireDefault(WbPort.default(p))
 
-    // A forwarded load writes back the SAME cycle it issues.
-    when(reqFire && loadCanForward) {
-        wb.valid     := true.B
-        wb.robIdx    := reqUop.robIdx
-        wb.pdst      := reqUop.pdst
-        wb.writesReg := reqUop.writesReg
-        wb.data      := formatLoad(forwardWord, reqUop.func3, reqByteOff)
-    }
-
-    // A memory-read load writes back from stage 2 the cycle after the read.
     when(ld2Valid) {
+        // (1) A memory-read load writes back from stage 2, the cycle after the read.
         wb.valid     := true.B
         wb.robIdx    := ld2RobIdx
         wb.pdst      := ld2Pdst
         wb.writesReg := ld2Writes
         wb.data      := formatLoad(io.memReadData, ld2Func3, ld2ByteOff)
         ld2Valid     := false.B // consumed
+    }.elsewhen(reqFire && loadCanForward) {
+        // (2) A forwarded load completes the SAME cycle it issues -- no memory access.
+        wb.valid     := true.B
+        wb.robIdx    := reqUop.robIdx
+        wb.pdst      := reqUop.pdst
+        wb.writesReg := reqUop.writesReg
+        wb.data      := formatLoad(forwardWord, reqUop.func3, reqByteOff)
+    }.elsewhen(reqFire && reqIsStore) {
+        // (3) STORE COMPLETION. A store produces no register value, but it MUST still report to
+        // the ROB, otherwise its entry is never marked `done`, the head never retires, and the
+        // machine deadlocks the first time a program executes a store. Having computed its
+        // address and data into the STQ, the store is architecturally finished at this point --
+        // the actual memory write happens later, at commit, when the ROB drains the STQ head.
+        // writesReg is false, so the PRF, the IssueQueue wakeup, and the BusyTable all ignore it;
+        // only the ROB acts on it.
+        wb.valid     := true.B
+        wb.robIdx    := reqUop.robIdx
+        wb.pdst      := p.zeroPreg.U
+        wb.writesReg := false.B
+        wb.data      := 0.U
     }
-    // (A forwarded load and a stage-2 writeback cannot both occur, because we only launch a new
-    //  memory read when ld2Free, i.e. when stage 2 is empty; and a forward does not enter the
-    //  pipe. So there is at most one CDB driver per cycle.)
 
     io.wb := wb
 

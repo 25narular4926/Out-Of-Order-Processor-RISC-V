@@ -211,6 +211,7 @@ class MemCommitSpec extends AnyFreeSpec with Matchers with ChiselSim {
         mem.io.read_2       := lsu.io.memRead
         mem.io.write_2      := lsu.io.memWrite
         mem.io.write_value_2 := lsu.io.memWriteData
+        mem.io.write_mask_2 := lsu.io.memWriteMask
         lsu.io.memReadData  := mem.io.read_value_2
 
         // tie off the unused PORT 1 and buttons
@@ -375,6 +376,176 @@ class MemCommitSpec extends AnyFreeSpec with Matchers with ChiselSim {
             dut.io.wb.pdst.expect(7.U)
             dut.io.wb.data.expect(0x12345678L.U)
             dut.clock.step(1)
+        }
+    }
+
+    // ----------------------------------------------------------------- sub-word store tests
+    /** Bring the harness up with everything idle. */
+    def initLsu(dut: LsuMemHarness): Unit = {
+        dut.io.ldqAllocReq.poke(false.B)
+        dut.io.stqAllocReq.poke(false.B)
+        dut.io.redirect.valid.poke(false.B)
+        dut.io.redirect.target.poke(0.U)
+        dut.io.robHeadIdx.poke(0.U)
+        clearLsuCommit(dut)
+        idleReq(dut)
+        pokeMemUop(dut.io.allocUop, 0, isLoad = false, isStore = false)
+        dut.clock.step(1)
+    }
+
+    /** Allocate a store (robIdx/stqIdx) into the STQ. */
+    def allocStore(dut: LsuMemHarness, robIdx: Int, stqIdx: Int): Unit = {
+        pokeMemUop(dut.io.allocUop, robIdx, isLoad = false, isStore = true, stqIdx = stqIdx)
+        dut.io.stqAllocReq.poke(true.B)
+        dut.clock.step(1)
+        dut.io.stqAllocReq.poke(false.B)
+    }
+
+    /** Issue a store: compute its address+data into its STQ slot (no memory access yet). */
+    def issueStore(dut: LsuMemHarness, robIdx: Int, stqIdx: Int, func3: Int,
+                   byteAddr: Long, data: Long): Unit = {
+        pokeMemUop(dut.io.req.bits.uop, robIdx, isLoad = false, isStore = true,
+                   stqIdx = stqIdx, func3 = func3)
+        dut.io.req.bits.rs1Data.poke(byteAddr.U)
+        dut.io.req.bits.rs2Data.poke((data & 0xffffffffL).U(p.xlen.W))
+        dut.io.req.valid.poke(true.B)
+        dut.clock.step(1)
+        idleReq(dut)
+    }
+
+    /** Commit the store at the STQ head -> drains it into memory this cycle. */
+    def commitStore(dut: LsuMemHarness, robIdx: Int): Unit = {
+        clearLsuCommit(dut)
+        dut.io.commit.valid.poke(true.B)
+        dut.io.commit.robIdx.poke(robIdx.U)
+        dut.io.commit.isStore.poke(true.B)
+        dut.io.robHeadIdx.poke(robIdx.U)
+        dut.io.req.valid.poke(false.B)
+        dut.clock.step(1)
+        clearLsuCommit(dut)
+    }
+
+    /** Issue a load that must go to memory, and return the word it writes back. */
+    def loadFromMem(dut: LsuMemHarness, robIdx: Int, func3: Int, byteAddr: Long,
+                    pdst: Int = 7): BigInt = {
+        dut.io.robHeadIdx.poke(robIdx.U)
+        pokeMemUop(dut.io.allocUop, robIdx, isLoad = true, isStore = false, ldqIdx = 0)
+        dut.io.ldqAllocReq.poke(true.B)
+        dut.clock.step(1)
+        dut.io.ldqAllocReq.poke(false.B)
+
+        pokeMemUop(dut.io.req.bits.uop, robIdx, isLoad = true, isStore = false, ldqIdx = 0,
+                   func3 = func3, pdst = pdst, writes = true)
+        dut.io.req.bits.rs1Data.poke(byteAddr.U)
+        dut.io.req.valid.poke(true.B)
+        dut.io.req.ready.expect(true.B) // no older store in the STQ -> memory read launches
+        dut.clock.step(1)               // SyncReadMem latency
+        idleReq(dut)
+
+        dut.io.wb.valid.expect(true.B)
+        dut.io.wb.robIdx.expect(robIdx.U)
+        val v = dut.io.wb.data.peek().litValue
+        dut.clock.step(1)
+        v
+    }
+
+    // Word 0x30 lives at byte address 0xC0. Byte lanes are little-endian: lane i = byte 0xC0+i.
+    "Lsu SB writes one byte and PRESERVES the surrounding three" in {
+        simulate(new LsuMemHarness(p)) { dut =>
+            initLsu(dut)
+
+            // Two stores: a full word, then a byte into the middle of it.
+            allocStore(dut, robIdx = 0, stqIdx = 0)
+            allocStore(dut, robIdx = 1, stqIdx = 1)
+
+            // SW 0xAABBCCDD -> word 0x30  (lane0=DD lane1=CC lane2=BB lane3=AA)
+            issueStore(dut, robIdx = 0, stqIdx = 0, func3 = 2, byteAddr = 0xC0L, data = 0xAABBCCDDL)
+            // SB 0x11 -> byte 0xC1 (lane 1 only)
+            issueStore(dut, robIdx = 1, stqIdx = 1, func3 = 0, byteAddr = 0xC1L, data = 0x11L)
+
+            commitStore(dut, robIdx = 0) // drains the SW (mask 1111)
+            commitStore(dut, robIdx = 1) // drains the SB (mask 0010) -- must NOT clobber AA/BB/DD
+
+            // The byte store replaced ONLY lane 1: 0xAABBCCDD -> 0xAABB11DD.
+            // (The old splice-over-zero implementation produced 0x00001100 here.)
+            loadFromMem(dut, robIdx = 2, func3 = 2, byteAddr = 0xC0L) shouldBe BigInt(0xAABB11DDL)
+        }
+    }
+
+    "Lsu SH writes one halfword and preserves the other" in {
+        simulate(new LsuMemHarness(p)) { dut =>
+            initLsu(dut)
+
+            allocStore(dut, robIdx = 0, stqIdx = 0)
+            allocStore(dut, robIdx = 1, stqIdx = 1)
+
+            // SW 0xAABBCCDD -> word 0x30
+            issueStore(dut, robIdx = 0, stqIdx = 0, func3 = 2, byteAddr = 0xC0L, data = 0xAABBCCDDL)
+            // SH 0xBEEF -> byte 0xC2 (upper half: lanes 2,3)
+            issueStore(dut, robIdx = 1, stqIdx = 1, func3 = 1, byteAddr = 0xC2L, data = 0xBEEFL)
+
+            commitStore(dut, robIdx = 0)
+            commitStore(dut, robIdx = 1)
+
+            // Upper half replaced, lower half (CCDD) intact.
+            loadFromMem(dut, robIdx = 2, func3 = 2, byteAddr = 0xC0L) shouldBe BigInt(0xBEEFCCDDL)
+        }
+    }
+
+    "Lsu LBU reads back an individual byte written by SB" in {
+        simulate(new LsuMemHarness(p)) { dut =>
+            initLsu(dut)
+
+            allocStore(dut, robIdx = 0, stqIdx = 0)
+            allocStore(dut, robIdx = 1, stqIdx = 1)
+
+            issueStore(dut, robIdx = 0, stqIdx = 0, func3 = 2, byteAddr = 0xC0L, data = 0xAABBCCDDL)
+            issueStore(dut, robIdx = 1, stqIdx = 1, func3 = 0, byteAddr = 0xC2L, data = 0x77L)
+
+            commitStore(dut, robIdx = 0)
+            commitStore(dut, robIdx = 1)
+
+            // LBU of byte 0xC2 (lane 2) must be the freshly stored 0x77, zero-extended.
+            loadFromMem(dut, robIdx = 2, func3 = 4, byteAddr = 0xC2L) shouldBe BigInt(0x77)
+            // and lane 3 is still 0xAA
+            loadFromMem(dut, robIdx = 3, func3 = 4, byteAddr = 0xC3L) shouldBe BigInt(0xAA)
+        }
+    }
+
+    "Lsu refuses to forward a partially-overlapping store to a wider load" in {
+        simulate(new LsuMemHarness(p)) { dut =>
+            initLsu(dut)
+
+            // Seed the word with a known value (SyncReadMem has no reset, so an unwritten word
+            // holds garbage -- we must establish all four lanes to make the check deterministic).
+            allocStore(dut, robIdx = 0, stqIdx = 0)
+            allocStore(dut, robIdx = 1, stqIdx = 1)
+            issueStore(dut, robIdx = 0, stqIdx = 0, func3 = 2, byteAddr = 0xC0L, data = 0xAABBCCDDL)
+            // An SB to lane 1 of the same word, which we deliberately leave UNCOMMITTED.
+            issueStore(dut, robIdx = 1, stqIdx = 1, func3 = 0, byteAddr = 0xC1L, data = 0x11L)
+
+            commitStore(dut, robIdx = 0) // only the SW drains; the SB is still sitting in the STQ
+
+            // A younger LW of the SAME word. The pending SB covers only lane 1, so it cannot
+            // supply the load's other three bytes -> the load must NOT be accepted (it retries).
+            dut.io.robHeadIdx.poke(1.U) // SB (rob 1) is now the oldest; the load (rob 2) is younger
+            pokeMemUop(dut.io.allocUop, 2, isLoad = true, isStore = false, ldqIdx = 0)
+            dut.io.ldqAllocReq.poke(true.B)
+            dut.clock.step(1)
+            dut.io.ldqAllocReq.poke(false.B)
+
+            pokeMemUop(dut.io.req.bits.uop, 2, isLoad = true, isStore = false, ldqIdx = 0,
+                       func3 = 2, pdst = 5, writes = true)
+            dut.io.req.bits.rs1Data.poke(0xC0.U)
+            dut.io.req.valid.poke(true.B)
+            dut.io.req.ready.expect(false.B) // blocked: partial coverage, cannot forward
+            dut.io.wb.valid.expect(false.B)
+            dut.clock.step(1)
+            idleReq(dut)
+
+            // Once the SB commits, the STQ hit disappears and the load reads the merged word.
+            commitStore(dut, robIdx = 1)
+            loadFromMem(dut, robIdx = 2, func3 = 2, byteAddr = 0xC0L) shouldBe BigInt(0xAABB11DDL)
         }
     }
 }

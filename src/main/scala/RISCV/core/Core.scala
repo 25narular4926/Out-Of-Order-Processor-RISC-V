@@ -45,6 +45,29 @@ class Core(p: OoOParams = OoOParams()) extends Module {
         val memory_read_value = Input(UInt(p.xlen.W))
         val memory_write = Output(Bool())
         val memory_write_value = Output(UInt(p.xlen.W))
+        val memory_write_mask = Output(UInt(4.W)) // byte enables for SB/SH/SW
+
+        // ---- debug / commit trace (verification only; no functional effect) ----
+        // The ROB retires in program order, so `dbg_commit_*` IS the architectural instruction
+        // stream. This is the observability hook the bring-up plan calls for: it lets a testbench
+        // watch what the core actually retires, and tandem-compare it against a golden model.
+        val dbg_commit_valid    = Output(Bool())
+        val dbg_commit_pc       = Output(UInt(p.xlen.W))
+        val dbg_redirect_valid  = Output(Bool())
+        val dbg_redirect_target = Output(UInt(p.xlen.W))
+        val dbg_dispatch_valid  = Output(Bool())
+        val dbg_dispatch_pc     = Output(UInt(p.xlen.W))
+        val dbg_rob_empty       = Output(Bool())
+        val dbg_rob_full        = Output(Bool())
+        // memory-path visibility (why is a load/store not completing?)
+        val dbg_iqmem_valid     = Output(Bool())
+        val dbg_iqmem_ready     = Output(Bool())
+        val dbg_iqmem_pc        = Output(UInt(p.xlen.W))
+        val dbg_iqmem_isStore   = Output(Bool())
+        val dbg_iqmem_isLoad    = Output(Bool())
+        val dbg_lsu_wb_valid    = Output(Bool())
+        val dbg_lsu_wb_robIdx   = Output(UInt(p.robIdxWidth.W))
+        val dbg_rob_head        = Output(UInt(p.robIdxWidth.W))
     })
 
     // ---- subsystem instances ------------------------------------------------
@@ -136,7 +159,27 @@ class Core(p: OoOParams = OoOParams()) extends Module {
     io.memory_read := lsu.io.memRead
     io.memory_write := lsu.io.memWrite
     io.memory_write_value := lsu.io.memWriteData
+    io.memory_write_mask := lsu.io.memWriteMask
     lsu.io.memReadData := io.memory_read_value
+
+    // ---- debug / commit trace ----
+    io.dbg_commit_valid    := rob.io.commit.valid
+    io.dbg_commit_pc       := rob.io.commit.pc
+    io.dbg_redirect_valid  := rob.io.redirect.valid
+    io.dbg_redirect_target := rob.io.redirect.target
+    io.dbg_dispatch_valid  := frontend.io.dispatchValid
+    io.dbg_dispatch_pc     := frontend.io.dispatchUop.pc
+    io.dbg_rob_empty       := rob.io.empty
+    io.dbg_rob_full        := rob.io.full
+
+    io.dbg_iqmem_valid   := iq.io.issueMem.valid
+    io.dbg_iqmem_ready   := iq.io.issueMem.ready
+    io.dbg_iqmem_pc      := iq.io.issueMem.bits.pc
+    io.dbg_iqmem_isStore := iq.io.issueMem.bits.isStore
+    io.dbg_iqmem_isLoad  := iq.io.issueMem.bits.isLoad
+    io.dbg_lsu_wb_valid  := lsu.io.wb.valid
+    io.dbg_lsu_wb_robIdx := lsu.io.wb.robIdx
+    io.dbg_rob_head      := rob.io.robHeadIdx
 }
 
 object Core extends App {

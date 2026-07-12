@@ -53,6 +53,7 @@ class Main(p: OoOParams = OoOParams()) extends Module {
     memory.io.read_2 := core.io.memory_read
     memory.io.write_2 := core.io.memory_write
     memory.io.write_value_2 := core.io.memory_write_value
+    memory.io.write_mask_2 := core.io.memory_write_mask
     core.io.memory_read_value := memory.io.read_value_2
 
     // flash mode: while the CPU is held (execute low), stream words into instruction memory

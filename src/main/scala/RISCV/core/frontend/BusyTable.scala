@@ -38,9 +38,31 @@ class BusyTable(p: OoOParams = OoOParams()) extends Module {
     // busy(i) == true => physical register i has a pending (not-yet-written-back) producer.
     val busy = RegInit(VecInit(Seq.fill(p.numPhysRegs)(false.B)))
 
-    // ---- reads: a source is ready when it is not busy. zeroPreg is always ready. ----
-    io.rs1Ready := (io.rs1 === p.zeroPreg.U) || !busy(io.rs1)
-    io.rs2Ready := (io.rs2 === p.zeroPreg.U) || !busy(io.rs2)
+    /**
+     * Is `tag` being written back on the CDB *this very cycle*?
+     *
+     * This is essential, not cosmetic. The busy bit is a REGISTER: a writeback at cycle T only
+     * clears it at T+1. But Rename and Dispatch are combinationally chained, so a uop is renamed
+     * AND enqueued into the IssueQueue in the same cycle T. Meanwhile the IssueQueue's own wakeup
+     * logic is gated on `when(valids(i))`, and the new slot does not become valid until T+1 --
+     * so it cannot see the cycle-T broadcast either.
+     *
+     * Without this term, a uop renamed in the exact cycle its producer writes back would latch
+     * `ready = false` from the stale busy bit, miss the only broadcast of that tag, and wait in
+     * the issue queue FOREVER -- stalling the ROB head and deadlocking the machine. (This is
+     * precisely what hung the first compiled C program: an `sw` whose base register was produced
+     * by an `addi` that wrote back in the same cycle the `sw` was renamed.)
+     *
+     * So: a source is ready if it is not busy, OR its value is appearing on the bus right now.
+     */
+    private def clearedThisCycle(tag: UInt): Bool =
+        io.wb.map { w =>
+            w.valid && w.writesReg && (w.pdst =/= p.zeroPreg.U) && (w.pdst === tag)
+        }.reduce(_ || _)
+
+    // ---- reads: ready == not busy, or being written back this cycle. zeroPreg is always ready.
+    io.rs1Ready := (io.rs1 === p.zeroPreg.U) || !busy(io.rs1) || clearedThisCycle(io.rs1)
+    io.rs2Ready := (io.rs2 === p.zeroPreg.U) || !busy(io.rs2) || clearedThisCycle(io.rs2)
 
     when(io.redirect) {
         // Full flush: nothing speculative survives, so no tag is pending. Clear everything.
