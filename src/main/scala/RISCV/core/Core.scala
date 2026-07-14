@@ -154,6 +154,10 @@ class Core(p: OoOParams = OoOParams()) extends Module {
     iq.io.redirect := rob.io.redirect
     lsu.io.redirect := rob.io.redirect
 
+    // branch-predictor training: the ROB broadcasts every branch/jump as it retires, so the
+    // gshare/BTB tables learn only from the architectural instruction stream.
+    frontend.io.brUpdate := rob.io.brUpdate
+
     // ---- LSU <-> data memory -------------------------------------------------
     io.memory_address := lsu.io.memAddr
     io.memory_read := lsu.io.memRead

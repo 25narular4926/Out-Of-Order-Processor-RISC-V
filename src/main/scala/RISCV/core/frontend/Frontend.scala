@@ -44,6 +44,7 @@ class Frontend(p: OoOParams = OoOParams()) extends Module {
         val wb = Input(Vec(p.numWbPorts, new WbPort(p)))
         val commit = Input(new CommitSignal(p))
         val redirect = Input(new Redirect(p))
+        val brUpdate = Input(new BrUpdate(p)) // predictor training, from the ROB at retirement
     })
 
     val fetch = Module(new Fetch(p))
@@ -54,6 +55,7 @@ class Frontend(p: OoOParams = OoOParams()) extends Module {
     // ---- Fetch ----
     fetch.io.enable := io.enable
     fetch.io.redirect := io.redirect
+    fetch.io.brUpdate := io.brUpdate
     io.imemAddr := fetch.io.imemAddr
     fetch.io.imemData := io.imemData
 

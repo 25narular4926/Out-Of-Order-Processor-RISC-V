@@ -168,6 +168,38 @@ class RobEntry(p: OoOParams) extends Bundle {
     val mispredicted = Bool() // set at writeback; triggers redirect when this entry retires
     val exception = Bool()
     val redirectTarget = UInt(p.xlen.W) // correct next-PC for a mispredict/exception
+
+    // Branch resolution, recorded at writeback for EVERY resolved branch/jump -- not just the
+    // mispredicted ones. The branch predictor is trained from these at commit, and it needs the
+    // outcome of correctly-predicted branches too (otherwise the tables would only ever learn
+    // from mistakes, and a branch that is already predicted right would never reinforce).
+    val brTaken = Bool() // actual direction
+    val brTarget = UInt(p.xlen.W) // actual next PC (the BTB's training target)
+}
+
+/**
+ * Branch-predictor training, broadcast by the ROB when a branch/jump RETIRES.
+ *
+ * Training at commit rather than at writeback is deliberate: the ROB retires in program order, so
+ * only architecturally-executed branches ever reach the predictor. Wrong-path branches -- which
+ * are, by definition, the ones the machine guessed wrong about -- never pollute the tables. The
+ * happy consequence is that the global history register only ever contains committed outcomes, so
+ * it needs NO snapshot/restore on a pipeline flush.
+ *
+ * The cost is training latency: a branch in a tight loop may be fetched again before its first
+ * instance retires, so the very first iterations still mispredict. That is an acceptable trade for
+ * not having to build history recovery.
+ */
+class BrUpdate(p: OoOParams) extends Bundle {
+    val valid = Bool() // a branch/jump retired this cycle
+    val pc = UInt(p.xlen.W) // its PC (indexes the BHT/BTB)
+    val taken = Bool() // actual direction (trains the gshare counter + history)
+    val target = UInt(p.xlen.W) // actual target (fills the BTB when taken)
+    val mispredicted = Bool() // whether we got it wrong (stats / future use)
+}
+
+object BrUpdate {
+    def default(p: OoOParams): BrUpdate = 0.U.asTypeOf(new BrUpdate(p))
 }
 
 /**

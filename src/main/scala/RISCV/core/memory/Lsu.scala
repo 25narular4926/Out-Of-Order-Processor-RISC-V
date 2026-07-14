@@ -150,10 +150,12 @@ class Lsu(p: OoOParams = OoOParams()) extends Module {
     // Helpers
     // =====================================================================================
 
-    /** True if `addr` (WORD address) is a memory-mapped region that must not be read
-     *  speculatively: the button MMIO word, or anything in the VGA framebuffer region. */
-    def isMmioWord(wordAddr: UInt): Bool =
-        (wordAddr === p.buttonAddrWord.U) || (wordAddr >= p.vgaBaseWord.U)
+    /** True if `addr` (WORD address) is memory-mapped I/O rather than RAM.
+     *
+     *  Anything at or above the top of RAM is a peripheral (timer, keyboard, UART, framebuffer,
+     *  debug ports, tohost -- see the memory map in OoOParams). MMIO must not be read
+     *  speculatively, so such a load waits until it is the ROB head before it executes. */
+    def isMmioWord(wordAddr: UInt): Bool = wordAddr >= p.memWords.U
 
     /** Age key relative to the ROB head: distance ahead of the oldest in-flight instruction.
      *  Smaller key == older. Valid because the in-flight window <= robEntries, so no aliasing. */

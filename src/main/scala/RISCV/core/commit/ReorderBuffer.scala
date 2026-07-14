@@ -45,6 +45,9 @@ class ReorderBuffer(p: OoOParams = OoOParams()) extends Module {
         // ---- global flush, generated here at the head ----
         val redirect = Output(new Redirect(p))
 
+        // ---- branch-predictor training, generated at retirement (see BrUpdate) ----
+        val brUpdate = Output(new BrUpdate(p))
+
         // ---- head index (LSU uses it for the MMIO-at-head rule) ----
         val robHeadIdx = Output(UInt(p.robIdxWidth.W))
 
@@ -80,8 +83,15 @@ class ReorderBuffer(p: OoOParams = OoOParams()) extends Module {
     for (port <- io.wb) {
         when(port.valid && entries(port.robIdx).valid) {
             entries(port.robIdx).done := true.B
-            // Branch/jump resolution: a mispredict (wrong direction or wrong target) means we
-            // must redirect to the architecturally-correct next PC carried on brTarget.
+            // Branch/jump resolution. Record the outcome of EVERY resolved branch, not only the
+            // mispredicted ones: the predictor is trained from this at commit, and it must also
+            // reinforce branches it already got right.
+            when(entries(port.robIdx).isBranchOrJump && port.isBranchResolved) {
+                entries(port.robIdx).brTaken  := port.brTaken
+                entries(port.robIdx).brTarget := port.brTarget
+            }
+            // A mispredict (wrong direction or wrong target) means we must redirect to the
+            // architecturally-correct next PC carried on brTarget.
             when(entries(port.robIdx).isBranchOrJump && port.mispredicted) {
                 entries(port.robIdx).mispredicted   := true.B
                 entries(port.robIdx).redirectTarget := port.brTarget
@@ -113,6 +123,8 @@ class ReorderBuffer(p: OoOParams = OoOParams()) extends Module {
         e.mispredicted   := false.B
         e.exception      := false.B
         e.redirectTarget := 0.U
+        e.brTaken        := false.B
+        e.brTarget       := 0.U
         entries(tailIdx) := e
         tail := tail + 1.U
     }
@@ -144,6 +156,16 @@ class ReorderBuffer(p: OoOParams = OoOParams()) extends Module {
     redirect.valid  := headFlushes
     redirect.target := headEntry.redirectTarget
     io.redirect := redirect
+
+    // Branch-predictor training. Fires when a branch/jump RETIRES -- so the predictor only ever
+    // learns from the architectural instruction stream, never from wrong-path speculation.
+    val brUpdate = Wire(new BrUpdate(p))
+    brUpdate.valid        := canRetire && headEntry.isBranchOrJump
+    brUpdate.pc           := headEntry.pc
+    brUpdate.taken        := headEntry.brTaken
+    brUpdate.target       := headEntry.brTarget
+    brUpdate.mispredicted := headEntry.mispredicted
+    io.brUpdate := brUpdate
 
     when(canRetire) {
         // Free the retired slot and advance the head.

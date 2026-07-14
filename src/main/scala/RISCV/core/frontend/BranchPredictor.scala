@@ -5,6 +5,8 @@ import chisel3.util._
 
 /**
  * Branch predictor for the 1-wide OoO front end.
+
+ 
  *
  * Three cooperating structures, all updated late (at branch resolution, driven by the ROB /
  * ALU via the `update` port which the orchestrator wires in later):

@@ -25,141 +25,24 @@ import scala.io.Source
  */
 class ProgramSpec extends AnyFreeSpec with Matchers with ChiselSim {
 
-    /** Core + Memory + flash port, with the MMIO write port brought out as a tohost mailbox. */
-    class SocHarness(p: OoOParams = OoOParams()) extends Module {
-        val io = IO(new Bundle {
-            val execute       = Input(Bool())
-            val flash         = Input(Bool())
-            val flash_address = Input(UInt(32.W))
-            val flash_value   = Input(UInt(32.W))
-            val btns          = Input(UInt(4.W))
-
-            // tohost mailbox (Memory's MMIO write port)
-            val tohost_valid = Output(Bool())
-            val tohost_addr  = Output(UInt(32.W))
-            val tohost_value = Output(UInt(32.W))
-
-            // commit trace (what the core actually retires, in program order)
-            val commit_valid    = Output(Bool())
-            val commit_pc       = Output(UInt(32.W))
-            val redirect_valid  = Output(Bool())
-            val redirect_target = Output(UInt(32.W))
-            val dispatch_valid  = Output(Bool())
-            val dispatch_pc     = Output(UInt(32.W))
-            val rob_empty       = Output(Bool())
-            val rob_full        = Output(Bool())
-            val iqmem_valid     = Output(Bool())
-            val iqmem_ready     = Output(Bool())
-            val iqmem_pc        = Output(UInt(32.W))
-            val iqmem_isStore   = Output(Bool())
-            val iqmem_isLoad    = Output(Bool())
-            val lsu_wb_valid    = Output(Bool())
-            val lsu_wb_robIdx   = Output(UInt(32.W))
-            val rob_head        = Output(UInt(32.W))
-        })
-
-        val memory = Module(new Memory(p))
-        val core   = Module(new Core(p))
-
-        core.io.execute := io.execute
-        memory.io.btns  := io.btns
-
-        // instruction fetch (byte address -> word address)
-        memory.io.read_1        := true.B
-        memory.io.write_1       := false.B
-        memory.io.write_value_1 := 0.U
-        memory.io.address_1     := core.io.program_memory_adress / 4.U
-        core.io.program_memory_value := memory.io.read_value_1
-
-        // data port
-        memory.io.address_2     := core.io.memory_address
-        memory.io.read_2        := core.io.memory_read
-        memory.io.write_2       := core.io.memory_write
-        memory.io.write_value_2 := core.io.memory_write_value
-        memory.io.write_mask_2  := core.io.memory_write_mask
-        core.io.memory_read_value := memory.io.read_value_2
-
-        // flash while the CPU is held
-        when(!io.execute) {
-            when(io.flash) {
-                memory.io.read_1        := false.B
-                memory.io.write_1       := true.B
-                memory.io.address_1     := io.flash_address
-                memory.io.write_value_1 := io.flash_value
-            }
-        }
-
-        io.tohost_valid := memory.io.write_vga
-        io.tohost_addr  := memory.io.address_vga
-        io.tohost_value := memory.io.write_value_vga
-
-        io.commit_valid    := core.io.dbg_commit_valid
-        io.commit_pc       := core.io.dbg_commit_pc
-        io.redirect_valid  := core.io.dbg_redirect_valid
-        io.redirect_target := core.io.dbg_redirect_target
-        io.dispatch_valid  := core.io.dbg_dispatch_valid
-        io.dispatch_pc     := core.io.dbg_dispatch_pc
-        io.rob_empty       := core.io.dbg_rob_empty
-        io.rob_full        := core.io.dbg_rob_full
-        io.iqmem_valid     := core.io.dbg_iqmem_valid
-        io.iqmem_ready     := core.io.dbg_iqmem_ready
-        io.iqmem_pc        := core.io.dbg_iqmem_pc
-        io.iqmem_isStore   := core.io.dbg_iqmem_isStore
-        io.iqmem_isLoad    := core.io.dbg_iqmem_isLoad
-        io.lsu_wb_valid    := core.io.dbg_lsu_wb_valid
-        io.lsu_wb_robIdx   := core.io.dbg_lsu_wb_robIdx
-        io.rob_head        := core.io.dbg_rob_head
-    }
-
-    /** Flash an image and print a cycle-by-cycle trace of what the core dispatches/retires. */
-    def traceProgram(hexPath: String, cycles: Int): Unit = {
-        val words = Source.fromFile(hexPath).getLines().map(_.trim).filter(_.nonEmpty).toList
-        simulate(new SocHarness()) { dut =>
-            dut.io.execute.poke(false.B)
-            dut.io.btns.poke(0.U)
-            dut.io.flash.poke(true.B)
-            words.zipWithIndex.foreach { case (w, i) =>
-                dut.io.flash_address.poke(i.U)
-                dut.io.flash_value.poke(java.lang.Long.parseLong(w, 16).U)
-                dut.clock.step(1)
-            }
-            dut.io.flash.poke(false.B)
-            dut.io.execute.poke(true.B)
-
-            def hx(v: BigInt) = f"0x$v%04x"
-            println("cyc | commit  | head | MEM-issue (iq->lsu)          | lsu.wb  | tohost")
-            for (c <- 0 until cycles) {
-                val cv   = dut.io.commit_valid.peek().litToBoolean
-                val cpc  = dut.io.commit_pc.peek().litValue
-                val head = dut.io.rob_head.peek().litValue
-                val mv   = dut.io.iqmem_valid.peek().litToBoolean
-                val mr   = dut.io.iqmem_ready.peek().litToBoolean
-                val mpc  = dut.io.iqmem_pc.peek().litValue
-                val mst  = dut.io.iqmem_isStore.peek().litToBoolean
-                val mld  = dut.io.iqmem_isLoad.peek().litToBoolean
-                val wv   = dut.io.lsu_wb_valid.peek().litToBoolean
-                val wrob = dut.io.lsu_wb_robIdx.peek().litValue
-                val tv   = dut.io.tohost_valid.peek().litToBoolean
-                val tval = dut.io.tohost_value.peek().litValue
-
-                val memStr =
-                    if (mv) f"V${if (mr) "/R" else "/-"} pc=${hx(mpc)}%-6s ${if (mst) "ST" else if (mld) "LD" else "??"}"
-                    else    "                             "
-                println(f"$c%3d | ${if (cv) hx(cpc) else "   -  "}%7s | $head%4d | $memStr%-27s | " +
-                        f"${if (wv) f"rob$wrob" else "  -  "}%7s | ${if (tv) hx(tval) else "-"}%s")
-                dut.clock.step(1)
-            }
-        }
-    }
-
-    "TRACE bytes.c" in { traceProgram("sw/build/bytes.hex", 80) }
-
     /**
      * Flash `hexPath` into the core, run it, and return the first value the program writes to
      * the tohost mailbox (or fail after `maxCycles`).
+     *
+     * If the image is absent, the test is CANCELLED rather than failed: these images are built
+     * from C by `sw/build.sh`, which needs a RISC-V cross-compiler. A machine without the
+     * toolchain (and a CI job that has not built them) should skip this suite, not report a
+     * spurious failure -- the RTL is not what is missing.
      */
     def runProgram(hexPath: String, maxCycles: Int = 20000): BigInt = {
-        val words = Source.fromFile(hexPath).getLines().map(_.trim).filter(_.nonEmpty).toList
+        val f = new java.io.File(hexPath)
+        if (!f.exists) {
+            cancel(
+              s"$hexPath not found -- build it first with `sw/build.sh sw/tests/<prog>.c` " +
+                "(needs riscv64-unknown-elf-gcc). Skipping."
+            )
+        }
+        val words = Source.fromFile(f).getLines().map(_.trim).filter(_.nonEmpty).toList
         var result: Option[BigInt] = None
 
         simulate(new SocHarness()) { dut =>
@@ -191,6 +74,62 @@ class ProgramSpec extends AnyFreeSpec with Matchers with ChiselSim {
         )
     }
 
+    // =====================================================================================
+    // Performance measurement.
+    //
+    // The core retires in program order, so `commit_valid` counts architectural instructions and
+    // `redirect_valid` counts branch mispredictions (each one costs a full pipeline flush under
+    // the commit-time recovery model). Together with the cycle count these give IPC and the
+    // misprediction rate -- the two numbers that say whether the branch predictor is doing
+    // anything at all.
+    // =====================================================================================
+    case class RunStats(cycles: Int, commits: Int, redirects: Int, result: Option[BigInt]) {
+        def ipc: Double = if (cycles == 0) 0.0 else commits.toDouble / cycles
+        def mispredPerCommit: Double = if (commits == 0) 0.0 else redirects.toDouble / commits
+        def summary: String =
+            f"cycles=$cycles%-7d commits=$commits%-6d redirects=$redirects%-5d " +
+                f"IPC=$ipc%.3f  mispred/instr=$mispredPerCommit%.4f"
+    }
+
+    def runWithStats(hexPath: String, maxCycles: Int = 500000): RunStats = {
+        val f = new java.io.File(hexPath)
+        if (!f.exists) cancel(s"$hexPath not found -- run sw/build.sh first. Skipping.")
+        val words = Source.fromFile(f).getLines().map(_.trim).filter(_.nonEmpty).toList
+
+        var cycles = 0; var commits = 0; var redirects = 0
+        var result: Option[BigInt] = None
+
+        simulate(new SocHarness()) { dut =>
+            dut.io.execute.poke(false.B)
+            dut.io.btns.poke(0.U)
+            dut.io.flash.poke(true.B)
+            words.zipWithIndex.foreach { case (w, i) =>
+                dut.io.flash_address.poke(i.U)
+                dut.io.flash_value.poke(java.lang.Long.parseLong(w, 16).U)
+                dut.clock.step(1)
+            }
+            dut.io.flash.poke(false.B)
+
+            dut.io.execute.poke(true.B)
+            while (result.isEmpty && cycles < maxCycles) {
+                if (dut.io.commit_valid.peek().litToBoolean) commits += 1
+                if (dut.io.redirect_valid.peek().litToBoolean) redirects += 1
+                if (dut.io.tohost_valid.peek().litToBoolean) {
+                    result = Some(dut.io.tohost_value.peek().litValue)
+                }
+                dut.clock.step(1)
+                cycles += 1
+            }
+        }
+        RunStats(cycles, commits, redirects, result)
+    }
+
+    "PERF: branch predictor effectiveness (sw/tests/bench.c)" in {
+        val s = runWithStats("sw/build/bench.hex", maxCycles = 5000000)
+        println(s"[PERF] bench.c (primes<500)  ${s.summary}")
+        s.result shouldBe Some(BigInt(95)) // pi(500) = 95; must stay correct whatever the perf
+    }
+
     "compiled C: sub-word stores preserve their neighbouring bytes (sw/tests/bytes.c)" in {
         // word = 0xAABBCCDD; word.byte[1] = 0x11; word.byte[3] = 0xEE  =>  0xEEBB11DD
         // Before the byte-write-enable fix the LSU spliced sub-word stores over a ZERO base
@@ -200,5 +139,14 @@ class ProgramSpec extends AnyFreeSpec with Matchers with ChiselSim {
 
     "compiled C: RV32IM arithmetic, mul/div/rem and a loop (sw/tests/arith.c)" in {
         runProgram("sw/build/arith.hex") shouldBe BigInt(0x600D)
+    }
+
+    "compiled C: hardware timer advances and DG_SleepMs terminates (sw/tests/timer.c)" in {
+        // The timer at 0x08000004 is what Doom's DG_SleepMs busy-waits on. If it never advanced,
+        // that loop would spin forever and Doom would hang on its first frame. This runs the
+        // exact same wait pattern, so a pass here means the loop provably terminates.
+        // The test also writes to the debug MMIO ports, so Memory.scala's printf emits its
+        // output to the simulation console -- the channel we will watch Doom boot on.
+        runProgram("sw/build/timer.hex", maxCycles = 2000000) shouldBe BigInt(0x900D)
     }
 }

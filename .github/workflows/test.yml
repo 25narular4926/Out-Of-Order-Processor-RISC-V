@@ -6,24 +6,102 @@ on:
     branches: ['main']
   pull_request:
   workflow_dispatch:
+  schedule:
+    # nightly: run the full RV32IM ISA compliance suite (too slow for every push)
+    - cron: '0 5 * * *'
 
 jobs:
+  # ---------------------------------------------------------------------------------------
+  # Fast job, runs on every push/PR: RTL unit tests + the compiled-C end-to-end tests.
+  #
+  # We rebuild the C test images from source rather than trusting the ones committed under
+  # sw/build/. They are committed so that a machine WITHOUT a RISC-V cross-compiler can still
+  # run ProgramSpec, but a committed build artifact can go stale (e.g. if the MMIO memory map
+  # moves and nobody rebuilds), which would show up as a baffling test failure. Rebuilding here
+  # keeps them honest.
+  # ---------------------------------------------------------------------------------------
   ci:
     name: ci
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Cache Scala
         uses: coursier/cache-action@v6
+
       - name: Setup Scala
         uses: coursier/setup-action@v1
         with:
           jvm: adopt:11
           apps: sbt
-      - name: Setup Dependencies
+
+      - name: Setup dependencies (Verilator + RISC-V cross-compiler)
         run: |
-          sudo apt-get install verilator
+          sudo apt-get update
+          sudo apt-get install -y verilator gcc-riscv64-unknown-elf
           verilator --version
-      - name: SBT Test
+          riscv64-unknown-elf-gcc --version | head -1
+
+      - name: Build compiled-C test images
+        run: |
+          chmod +x sw/build.sh
+          for prog in sw/tests/*.c; do
+            ./sw/build.sh "$prog"
+          done
+          ls -l sw/build/*.hex
+
+      - name: Fail if the committed test images are stale
+        run: |
+          if ! git diff --quiet -- sw/build; then
+            echo "::error::sw/build/*.hex differ from a fresh build."
+            echo "Rebuild them (sw/build.sh sw/tests/<prog>.c) and commit the result."
+            git diff --stat -- sw/build
+            exit 1
+          fi
+          echo "Committed images match a fresh build."
+
+      - name: SBT test
         run: sbt test
+
+  # ---------------------------------------------------------------------------------------
+  # RV32IM compliance: the official riscv-tests rv32ui + rv32um suites.
+  #
+  # Each test needs its own Verilator build (~50 of them), so this is far too slow to run on
+  # every push. It runs nightly and on demand instead. IsaSpec cancels cleanly when the images
+  # are absent, which is why the fast job above can ignore it.
+  # ---------------------------------------------------------------------------------------
+  isa:
+    name: rv32im-compliance
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Scala
+        uses: coursier/cache-action@v6
+
+      - name: Setup Scala
+        uses: coursier/setup-action@v1
+        with:
+          jvm: adopt:11
+          apps: sbt
+
+      - name: Setup dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator gcc-riscv64-unknown-elf
+          verilator --version
+
+      - name: Checkout riscv-tests
+        run: git clone --depth 1 https://github.com/riscv-software-src/riscv-tests.git sw/riscv-tests
+
+      - name: Build the ISA suite
+        run: |
+          chmod +x sw/isa/build_isa.sh
+          ./sw/isa/build_isa.sh
+
+      - name: Run RV32IM compliance
+        run: sbt "testOnly RISCV.IsaSpec"

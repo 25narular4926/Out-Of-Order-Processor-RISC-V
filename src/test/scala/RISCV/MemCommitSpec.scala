@@ -219,7 +219,7 @@ class MemCommitSpec extends AnyFreeSpec with Matchers with ChiselSim {
         mem.io.read_1        := false.B
         mem.io.write_1       := false.B
         mem.io.write_value_1 := 0.U
-        mem.io.btns          := 0.U
+        mem.io.keys          := 0.U
     }
 
     // LSU helpers ------------------------------------------------------

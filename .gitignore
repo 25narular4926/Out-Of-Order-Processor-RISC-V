@@ -1,8 +1,24 @@
 ### Project Specific
 test_run_dir/*
 generated/
-build/
+/build/
 chiselsim/
+
+### Software build outputs (sw/)
+# The small compiled-C test images (sw/build/*.hex) ARE committed: they are the inputs to
+# ProgramSpec, and CI has no RISC-V cross-compiler, so it could never regenerate them.
+# Everything else under sw/build is intermediate and regenerable.
+# NOTE: this must be path-specific rather than a bare `build/` -- git cannot re-include a file
+# whose parent directory is excluded.
+sw/build/*.elf
+sw/build/*.bin
+sw/build/*.dis
+sw/build/*.map
+
+# The ISA suite is large (48 images) and needs a 7 MB riscv-tests checkout, so it is generated
+# on demand by sw/isa/build_isa.sh. IsaSpec skips cleanly when these are absent.
+sw/isa/build/
+sw/riscv-tests/
 
 ### SBT
 target/

@@ -29,7 +29,8 @@ class Main(p: OoOParams = OoOParams()) extends Module {
     memory.io.read_1 := true.B
     memory.io.write_1 := false.B
     memory.io.write_value_1 := 0.U
-    memory.io.btns := io.btns
+    // the 4 on-board buttons appear in the low bits of the keyboard bitmap
+    memory.io.keys := io.btns
 
     val vga = Module(new VGAController())
     vga.io.address := memory.io.address_vga

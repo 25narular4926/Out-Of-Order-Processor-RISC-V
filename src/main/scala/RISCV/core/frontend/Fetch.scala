@@ -42,6 +42,9 @@ class Fetch(p: OoOParams = OoOParams()) extends Module {
         val enable = Input(Bool())
         val redirect = Input(new Redirect(p))
 
+        // branch-predictor training, from the ROB at retirement
+        val brUpdate = Input(new BrUpdate(p))
+
         // instruction memory: present a BYTE address, get the word back next cycle
         val imemAddr = Output(UInt(p.xlen.W))
         val imemData = Input(UInt(p.xlen.W))
@@ -61,16 +64,23 @@ class Fetch(p: OoOParams = OoOParams()) extends Module {
     val predTaken = predictor.io.predict.taken
     val predTarget = predictor.io.predict.target
 
-    // The predictor update port is NOT driven by Fetch in this first pass (branch resolution
-    // lives in the back end). The orchestrator wires it from the ROB/ALU. Tie off here so the
-    // module elaborates standalone; the orchestrator can override these from outside Fetch by
-    // exposing the predictor, but per the fixed Frontend IO the update port stays internal and
-    // is left in its reset behaviour for v1. See report.
-    predictor.io.update.valid := false.B
-    predictor.io.update.pc := 0.U
-    predictor.io.update.taken := false.B
-    predictor.io.update.target := 0.U
-    predictor.io.update.mispredicted := false.B
+    // Predictor training, driven from the ROB at RETIREMENT (io.brUpdate). Because the ROB retires
+    // in program order, only architecturally-executed branches ever train the tables -- wrong-path
+    // branches never pollute them, and the global history register therefore holds only committed
+    // outcomes and needs no snapshot/restore across a flush.
+    //
+    // (This port used to be tied off, which left the gshare/BTB tables frozen at their reset state
+    // forever: every branch was predicted from a cold table and never learned. On a branch-heavy
+    // workload that cost roughly one full pipeline flush per three retired instructions.)
+    predictor.io.update.valid := io.brUpdate.valid
+    predictor.io.update.pc := io.brUpdate.pc
+    predictor.io.update.taken := io.brUpdate.taken
+    predictor.io.update.target := io.brUpdate.target
+    predictor.io.update.mispredicted := io.brUpdate.mispredicted
+
+    // RAS: the predict port does not consult the return-address stack yet (doing so needs
+    // pre-decode at fetch to know an instruction IS a call/return), so driving push/pop here
+    // would have no effect on prediction. Left inert until the predict side can use it.
     predictor.io.update.pushRas := false.B
     predictor.io.update.pushRasAddr := 0.U
     predictor.io.update.popRas := false.B

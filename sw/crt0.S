@@ -29,9 +29,9 @@ _start:
     call    main
 
     # ---- publish main()'s return value to the testbench mailbox ----
-    # (0x4000 == word 0x1000 == vgaBaseWord: the first address Memory routes to the MMIO port.
-    #  Written as a literal because `li` cannot take a linker-script symbol.)
-    li      t0, 0x4000
+    # 0x70000010 is the tohost MMIO word (see OoOParams). It sits well above RAM, so it keeps
+    # working no matter how large RAM grows for a Doom-sized image.
+    li      t0, 0x70000010
     sw      a0, 0(t0)
 
     # ---- halt (spin) ----
