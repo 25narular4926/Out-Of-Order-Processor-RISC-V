@@ -68,6 +68,13 @@ class Memory(p: OoOParams = OoOParams()) extends Module {
     // Four byte lanes per word so writes can be masked per byte.
     val memory = SyncReadMem(p.memWords, Vec(4, UInt(8.W)))
 
+    // Optional preload of RAM at time zero (see OoOParams.memInitFile). Emits $readmemh into the
+    // memory array, which Verilator honours. Required for Doom-sized images, where streaming the
+    // program in through the 1-word-per-cycle flash port would take hours.
+    if (p.memInitFile.nonEmpty) {
+        loadMemoryFromFileInline(memory, p.memInitFile)
+    }
+
     /** Split a 32-bit word into little-endian byte lanes (lane 0 = bits 7:0). */
     private def toLanes(word: UInt): Vec[UInt] =
         VecInit(Seq.tabulate(4)(i => word(8 * i + 7, 8 * i)))
@@ -140,14 +147,14 @@ class Memory(p: OoOParams = OoOParams()) extends Module {
     io.uart_valid := isUartTx && doWrite
     io.uart_char  := io.write_value_2(7, 0)
 
-    // Simulation console: these printfs are how we watch Doom boot.
+    // Simulation console: these printfs are how we watch Doom boot. Only the debug-char port
+    // prints; the UART port is left as a silent output (uart_valid/uart_char) so we do NOT
+    // double-print -- the port's debug_log() writes every character to BOTH 0x70000000 and the
+    // UART, and printing both would echo each character twice.
     when(isDbgChar && doWrite) {
         printf("%c", io.write_value_2(7, 0))
     }
     when(isDbgNum && doWrite) {
         printf("0x%x", io.write_value_2)
-    }
-    when(isUartTx && doWrite) {
-        printf("%c", io.write_value_2(7, 0))
     }
 }

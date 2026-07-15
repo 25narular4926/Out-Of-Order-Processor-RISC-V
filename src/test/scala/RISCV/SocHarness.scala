@@ -37,6 +37,32 @@ class SocHarness(p: OoOParams = OoOParams()) extends Module {
         val rob_empty       = Output(Bool())
         val rob_full        = Output(Bool())
         val rob_head        = Output(UInt(32.W))
+
+        // ---- HARDWARE PERFORMANCE COUNTERS + LATCHED TOHOST ----
+        // These exist for SIMULATION SPEED, not for the RTL's benefit.
+        //
+        // Every peek()/step() from Scala is a round-trip across the JVM<->Verilator boundary,
+        // costing on the order of a millisecond. A testbench that peeks a few signals every
+        // single cycle therefore runs at ~500 cycles/sec -- it measures IPC latency, not
+        // simulation speed, and it made a Doom-sized workload (10^8 instructions) look like it
+        // would take ~13 days.
+        //
+        // Counting in hardware instead lets the testbench step in huge batches and read the
+        // totals once at the end. Latching tohost (rather than watching for its single-cycle
+        // pulse) is what makes that safe: the program's exit code cannot be missed between polls.
+        val perf_cycles    = Output(UInt(64.W))
+        val perf_commits   = Output(UInt(64.W))
+        val perf_redirects = Output(UInt(64.W))
+        val tohost_seen    = Output(Bool())  // sticky: set on the first tohost write
+        val tohost_data    = Output(UInt(32.W)) // sticky: the value written
+
+        // ---- framebuffer capture: read out the last rendered frame at the end of a run ----
+        // Doom's DG_DrawFrame writes fbWidth*fbHeight words to the framebuffer MMIO region. We
+        // mirror those writes into a capture RAM so the testbench can scan it out ONCE (one peek
+        // per pixel) after the run and dump an image -- rather than peeking every cycle.
+        val fb_read_addr  = Input(UInt(32.W))
+        val fb_read_data  = Output(UInt(32.W))
+        val fb_writes     = Output(UInt(64.W)) // how many fb pixels have been written (progress)
     })
 
     val memory = Module(new Memory(p))
@@ -85,4 +111,41 @@ class SocHarness(p: OoOParams = OoOParams()) extends Module {
     io.rob_empty       := core.io.dbg_rob_empty
     io.rob_full        := core.io.dbg_rob_full
     io.rob_head        := core.io.dbg_rob_head
+
+    // ---- hardware performance counters (only tick while the CPU is actually running) ----
+    val cycles    = RegInit(0.U(64.W))
+    val commits   = RegInit(0.U(64.W))
+    val redirects = RegInit(0.U(64.W))
+
+    when(io.execute) {
+        cycles    := cycles + 1.U
+        commits   := commits + core.io.dbg_commit_valid   // Bool widens to 0/1
+        redirects := redirects + core.io.dbg_redirect_valid
+    }
+
+    io.perf_cycles    := cycles
+    io.perf_commits   := commits
+    io.perf_redirects := redirects
+
+    // ---- sticky tohost: the write is a single-cycle pulse, so latch it ----
+    val tohostSeen = RegInit(false.B)
+    val tohostData = RegInit(0.U(32.W))
+    when(memory.io.tohost_valid && !tohostSeen) {
+        tohostSeen := true.B
+        tohostData := memory.io.tohost_value
+    }
+    io.tohost_seen := tohostSeen
+    io.tohost_data := tohostData
+
+    // ---- framebuffer capture ----
+    // Mirror every framebuffer write (Memory routes those out on write_vga, addressed relative to
+    // the fb base) into a capture RAM, and count them so a run can report rendering progress.
+    val fbMem    = SyncReadMem(p.fbWords, UInt(32.W))
+    val fbWrites = RegInit(0.U(64.W))
+    when(memory.io.write_vga && (memory.io.address_vga < p.fbWords.U)) {
+        fbMem.write(memory.io.address_vga, memory.io.write_value_vga)
+        fbWrites := fbWrites + 1.U
+    }
+    io.fb_read_data := fbMem.read(io.fb_read_addr)
+    io.fb_writes    := fbWrites
 }

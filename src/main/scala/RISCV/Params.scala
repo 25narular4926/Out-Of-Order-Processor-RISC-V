@@ -37,7 +37,16 @@ case class OoOParams(
     clockHz: Int = 125000000,
     // --- framebuffer geometry (Doom's DG_DrawFrame target) ---
     fbWidth: Int = 320,
-    fbHeight: Int = 240
+    fbHeight: Int = 240,
+    // --- memory preload ---
+    // Path to a hex image ($readmemh format: one 32-bit word per line, line N == word N). When
+    // set, RAM is initialised at elaboration instead of being streamed in through the flash port.
+    //
+    // This is not a convenience -- it is a hard requirement at Doom scale. The flash port accepts
+    // ONE word per clock, and driving it from the testbench costs a JVM<->Verilator round-trip per
+    // word (~1 ms). A 24 MB Doom image is ~6M words, so flashing it would take hours before the
+    // CPU executed a single instruction. $readmemh loads it in one shot at time zero.
+    memInitFile: String = ""
 ) {
     require(numPhysRegs >= numArchRegs + 1, "need at least one free physical register")
     require(isPow2(numPhysRegs), "numPhysRegs must be a power of two")

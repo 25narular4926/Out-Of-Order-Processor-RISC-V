@@ -20,6 +20,13 @@ sw/build/*.map
 sw/isa/build/
 sw/riscv-tests/
 
+# The Doom clone is a NESTED GPL repo (doomgeneric + the RISC-V port) plus a 21 MB WAD and a
+# ~50 MB build image. We do NOT vendor it -- it mixes GPL source into this permissively-licensed
+# RTL repo, and it is huge. Our own porting files live in sw/doom-port/ (tracked); see its README
+# for how to fetch the clone and build. DoomSpec skips cleanly when the built image is absent.
+sw/doom/
+sw/wad/
+
 ### SBT
 target/
 lib_managed/
