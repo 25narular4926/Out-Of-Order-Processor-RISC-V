@@ -68,6 +68,11 @@ class Core(p: OoOParams = OoOParams()) extends Module {
         val dbg_lsu_wb_valid    = Output(Bool())
         val dbg_lsu_wb_robIdx   = Output(UInt(p.robIdxWidth.W))
         val dbg_rob_head        = Output(UInt(p.robIdxWidth.W))
+
+        // ---- stall attribution (where do the cycles go?) ----
+        val dbg_muldiv_busy  = Output(Bool()) // MULDIV FSM occupied (iterative divide in flight)
+        val dbg_head_stalled = Output(Bool()) // ROB non-empty but head not ready to retire
+        val dbg_iq_alu_stuck = Output(Bool()) // an ALU op is ready to issue but the port didn't fire
     })
 
     // ---- subsystem instances ------------------------------------------------
@@ -184,6 +189,11 @@ class Core(p: OoOParams = OoOParams()) extends Module {
     io.dbg_lsu_wb_valid  := lsu.io.wb.valid
     io.dbg_lsu_wb_robIdx := lsu.io.wb.robIdx
     io.dbg_rob_head      := rob.io.robHeadIdx
+
+    // ---- stall attribution ----
+    io.dbg_muldiv_busy  := !execMulDiv.io.req.ready            // divider FSM occupied
+    io.dbg_head_stalled := !rob.io.empty && !rob.io.commit.valid // head present but can't retire
+    io.dbg_iq_alu_stuck := iq.io.issueAlu.valid && !iq.io.issueAlu.ready
 }
 
 object Core extends App {

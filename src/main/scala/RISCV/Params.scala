@@ -26,6 +26,10 @@ case class OoOParams(
     stqEntries: Int = 8, // in-flight stores
     maxBranches: Int = 4, // simultaneously-speculated branches = branch-mask width = #snapshots
     numWbPorts: Int = 3, // common-data-bus / writeback ports (ALU, MULDIV, MEM)
+    // iterative-divider radix: bits retired per cycle. 1 => 32-cycle divide (original);
+    // 4 => 8-cycle divide. Higher is fewer cycles but a longer combinational subtract chain
+    // (K subtractors in series), so it trades divide latency against Fmax. Must divide xlen.
+    divBitsPerCycle: Int = 4,
     // --- memory ---
     memWords: Int = 4096, // word-addressed RAM depth (shared instruction + data)
     // --- branch predictor ---
@@ -52,6 +56,8 @@ case class OoOParams(
     require(isPow2(numPhysRegs), "numPhysRegs must be a power of two")
     require(robEntries >= 2 && isPow2(robEntries), "robEntries must be a power of two >= 2")
     require(maxBranches >= 1)
+    require(divBitsPerCycle >= 1 && xlen % divBitsPerCycle == 0,
+      "divBitsPerCycle must be >= 1 and divide xlen")
 
     // derived widths --------------------------------------------------------
     def pregWidth: Int = log2Ceil(numPhysRegs) // physical register tag width

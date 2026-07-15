@@ -292,6 +292,24 @@ class ExecuteSpec extends AnyFreeSpec with Matchers with ChiselSim {
             result
         }
 
+        // Dense sweep -- the ISA suite uses curated vectors, which can miss a radix-K divider bug
+        // that only shows for certain bit patterns. This mimics itoa (repeated /10, %10), the exact
+        // operation Doom's vsnprintf hung on. Every value is checked against Scala's own div/rem.
+        "DIVU/REMU dense sweep (itoa pattern: /10, %10, and assorted divisors)" in {
+            simulate(new ExecMulDiv(p)) { dut =>
+                val divisors = Seq(1L, 2L, 3L, 7L, 10L, 16L, 100L, 255L, 1000L)
+                val dividends = (0L to 300L) ++ Seq(0xffffffffL, 0x80000000L, 0x7fffffffL, 12345L, 65535L)
+                for (d <- divisors; n <- dividends) {
+                    val gotQ = runDiv(dut, func3 = 5, rs1 = n, rs2 = d) & 0xffffffffL // DIVU
+                    val gotR = runDiv(dut, func3 = 7, rs1 = n, rs2 = d) & 0xffffffffL // REMU
+                    val expQ = (n & 0xffffffffL) / d
+                    val expR = (n & 0xffffffffL) % d
+                    withClue(f"DIVU $n%d / $d%d: ") { gotQ shouldBe expQ }
+                    withClue(f"REMU $n%d %% $d%d: ") { gotR shouldBe expR }
+                }
+            }
+        }
+
         "DIV signed: -20 / 3 = -6 (truncating toward zero)" in {
             simulate(new ExecMulDiv(p)) { dut =>
                 val q = runDiv(dut, func3 = 4, rs1 = -20L & 0xffffffffL, rs2 = 3)

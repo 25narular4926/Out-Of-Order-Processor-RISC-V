@@ -115,6 +115,9 @@ class ProgramSpec extends AnyFreeSpec with Matchers with ChiselSim {
         cycles:    Long,
         commits:   Long,
         redirects: Long,
+        divbusy:   Long,
+        headstall: Long,
+        headstalldiv: Long,
         result:    Option[BigInt],
         runSecs:   Double // WALL TIME OF THE STEPPING LOOP ONLY -- excludes Verilator compile
     ) {
@@ -122,9 +125,13 @@ class ProgramSpec extends AnyFreeSpec with Matchers with ChiselSim {
         def mispredPerCommit: Double = if (commits == 0) 0.0 else redirects.toDouble / commits
         def cyclesPerSec: Double = if (runSecs <= 0) 0.0 else cycles / runSecs
         def instrPerSec: Double = if (runSecs <= 0) 0.0 else commits / runSecs
+        private def pct(n: Long): Double = if (cycles == 0) 0.0 else 100.0 * n / cycles
         def summary: String =
-            f"cycles=$cycles%-7d commits=$commits%-6d redirects=$redirects%-5d " +
+            f"cycles=$cycles%-8d commits=$commits%-7d redirects=$redirects%-6d " +
                 f"IPC=$ipc%.3f  mispred/instr=$mispredPerCommit%.4f"
+        def stallSummary: String =
+            f"divider busy ${pct(divbusy)}%.1f%% of cycles | head stalled ${pct(headstall)}%.1f%% | " +
+                f"head stalled ON divider ${pct(headstalldiv)}%.1f%%"
     }
 
     /**
@@ -145,6 +152,7 @@ class ProgramSpec extends AnyFreeSpec with Matchers with ChiselSim {
         val words = Source.fromFile(f).getLines().map(_.trim).filter(_.nonEmpty).toList
 
         var cycles = 0L; var commits = 0L; var redirects = 0L
+        var divbusy = 0L; var headstall = 0L; var headstalldiv = 0L
         var runSecs = 0.0
         var result: Option[BigInt] = None
 
@@ -180,28 +188,31 @@ class ProgramSpec extends AnyFreeSpec with Matchers with ChiselSim {
             cycles = dut.io.perf_cycles.peek().litValue.toLong
             commits = dut.io.perf_commits.peek().litValue.toLong
             redirects = dut.io.perf_redirects.peek().litValue.toLong
+            divbusy = dut.io.perf_divbusy.peek().litValue.toLong
+            headstall = dut.io.perf_headstall.peek().litValue.toLong
+            headstalldiv = dut.io.perf_headstalldiv.peek().litValue.toLong
             if (dut.io.tohost_seen.peek().litToBoolean) {
                 result = Some(dut.io.tohost_data.peek().litValue)
             }
         }
-        RunStats(cycles, commits, redirects, result, runSecs)
+        RunStats(cycles, commits, redirects, divbusy, headstall, headstalldiv, result, runSecs)
     }
 
-    "PERF: branch predictor effectiveness (sw/tests/bench.c)" in {
-        val s = runWithStats("sw/build/bench.hex", maxCycles = 5000000)
+    "PERF: stall attribution (where do the cycles go?)" in {
+        // Two contrasting workloads: bench.c (prime sieve -- hammers integer divide via `n % d`
+        // in its inner loop) and arith.c (mostly ALU + a folded loop). Comparing their stall
+        // breakdowns tells us whether the low IPC is divider-bound, branch-bound, or elsewhere --
+        // i.e. which optimization is actually worth doing.
+        val bench = runWithStats("sw/build/bench.hex", maxCycles = 5000000)
+        println(s"[PERF] bench.c (primes<500)  ${bench.summary}")
+        println(s"[PERF]   ${bench.stallSummary}")
+        println(f"[PERF]   sim: ${bench.cyclesPerSec}%,.0f cycles/sec, ${bench.instrPerSec}%,.0f instr/sec")
+        bench.result shouldBe Some(BigInt(95))
 
-        println(s"[PERF] bench.c (primes<500)  ${s.summary}")
-
-        // SIMULATION THROUGHPUT (stepping only -- Verilator compile time excluded). This is the
-        // number that decides whether Doom is tractable: Doom needs on the order of 10^8
-        // instructions to reach its first rendered frame, so this rate sets the whole schedule.
-        println(f"[PERF] verilator: ${s.cyclesPerSec}%,.0f cycles/sec, ${s.instrPerSec}%,.0f instr/sec " +
-            f"(${s.runSecs}%.2f s to run ${s.cycles}%,d cycles)")
-        if (s.instrPerSec > 0) {
-            println(f"[PERF] => 100M-instruction Doom boot ~= ${100e6 / s.instrPerSec / 3600}%,.1f hours")
-        }
-
-        s.result shouldBe Some(BigInt(95)) // pi(500) = 95; must stay correct whatever the perf
+        val arith = runWithStats("sw/build/arith.hex", maxCycles = 2000000)
+        println(s"[PERF] arith.c              ${arith.summary}")
+        println(s"[PERF]   ${arith.stallSummary}")
+        arith.result shouldBe Some(BigInt(0x600D))
     }
 
     "PRELOAD: $readmemh initialises RAM without using the flash port" in {

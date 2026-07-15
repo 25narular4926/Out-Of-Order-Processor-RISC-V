@@ -130,16 +130,24 @@ class ExecMulDiv(p: OoOParams = OoOParams()) extends Module {
             state := sBusy
         }
     }.elsewhen(state === sBusy) {
-        // One restoring-division step per cycle. We shift the (remainder:quotient) pair left by
-        // one, trial-subtract the divisor from the remainder, and set the LSB of the quotient if
-        // it fit. After `xlen` steps quotient/remainder hold the unsigned results.
-        val shifted = Cat(remainder(xlen - 2, 0), quotient(xlen - 1)) // (rem << 1) | quot MSB
-        val trial = shifted - divisorReg
-        val fits = shifted >= divisorReg
-        remainder := Mux(fits, trial, shifted)
-        quotient := Cat(quotient(xlen - 2, 0), fits.asUInt) // (quot << 1) | fits
-        count := count + 1.U
-        when(count === (xlen - 1).U) { state := sDone }
+        // Restoring long division, retiring `p.divBitsPerCycle` bits per cycle. One step shifts
+        // the (remainder:quotient) pair left by one, trial-subtracts the divisor from the
+        // remainder, and sets the low quotient bit if it fit. We UNROLL that step K times
+        // combinationally so each cycle advances K bits; after xlen/K cycles the quotient and
+        // remainder hold the unsigned results. K=1 is the original 32-cycle divider.
+        val K = p.divBitsPerCycle
+        def step(rem: UInt, quot: UInt): (UInt, UInt) = {
+            val shifted = Cat(rem(xlen - 2, 0), quot(xlen - 1)) // (rem << 1) | quot MSB
+            val fits    = shifted >= divisorReg
+            val nextRem = Mux(fits, shifted - divisorReg, shifted)
+            (nextRem, Cat(quot(xlen - 2, 0), fits.asUInt))     // (quot << 1) | fits
+        }
+        var r = remainder; var q = quotient
+        for (_ <- 0 until K) { val (nr, nq) = step(r, q); r = nr; q = nq }
+        remainder := r
+        quotient  := q
+        count := count + K.U
+        when(count === (xlen - K).U) { state := sDone }
     }.elsewhen(state === sDone) {
         state := sIdle
     }

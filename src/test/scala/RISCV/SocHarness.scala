@@ -53,6 +53,15 @@ class SocHarness(p: OoOParams = OoOParams()) extends Module {
         val perf_cycles    = Output(UInt(64.W))
         val perf_commits   = Output(UInt(64.W))
         val perf_redirects = Output(UInt(64.W))
+        // stall attribution
+        val perf_divbusy      = Output(UInt(64.W)) // cycles the divider FSM was busy
+        val perf_headstall    = Output(UInt(64.W)) // cycles the ROB head could not retire
+        val perf_headstalldiv = Output(UInt(64.W)) // head stalled AND divider busy (divider-bound)
+        // committed-PC range (localises a hang loop). Resettable so a single window can be sampled.
+        val pc_range_reset = Input(Bool())
+        val pc_min         = Output(UInt(32.W))
+        val pc_max         = Output(UInt(32.W))
+        val pc_last        = Output(UInt(32.W))
         val tohost_seen    = Output(Bool())  // sticky: set on the first tohost write
         val tohost_data    = Output(UInt(32.W)) // sticky: the value written
 
@@ -117,15 +126,40 @@ class SocHarness(p: OoOParams = OoOParams()) extends Module {
     val commits   = RegInit(0.U(64.W))
     val redirects = RegInit(0.U(64.W))
 
+    val divbusy      = RegInit(0.U(64.W))
+    val headstall    = RegInit(0.U(64.W))
+    val headstalldiv = RegInit(0.U(64.W))
+
     when(io.execute) {
         cycles    := cycles + 1.U
         commits   := commits + core.io.dbg_commit_valid   // Bool widens to 0/1
         redirects := redirects + core.io.dbg_redirect_valid
+        divbusy      := divbusy + core.io.dbg_muldiv_busy
+        headstall    := headstall + core.io.dbg_head_stalled
+        headstalldiv := headstalldiv + (core.io.dbg_head_stalled && core.io.dbg_muldiv_busy)
     }
 
     io.perf_cycles    := cycles
     io.perf_commits   := commits
     io.perf_redirects := redirects
+    io.perf_divbusy      := divbusy
+    io.perf_headstall    := headstall
+    io.perf_headstalldiv := headstalldiv
+
+    // committed-PC range over the current window (to localise a suspected hang loop)
+    val pcMin  = RegInit("hffffffff".U(32.W))
+    val pcMax  = RegInit(0.U(32.W))
+    val pcLast = RegInit(0.U(32.W))
+    when(io.pc_range_reset) {
+        pcMin := "hffffffff".U; pcMax := 0.U
+    }.elsewhen(io.execute && core.io.dbg_commit_valid) {
+        when(core.io.dbg_commit_pc < pcMin) { pcMin := core.io.dbg_commit_pc }
+        when(core.io.dbg_commit_pc > pcMax) { pcMax := core.io.dbg_commit_pc }
+        pcLast := core.io.dbg_commit_pc
+    }
+    io.pc_min  := pcMin
+    io.pc_max  := pcMax
+    io.pc_last := pcLast
 
     // ---- sticky tohost: the write is a single-cycle pulse, so latch it ----
     val tohostSeen = RegInit(false.B)
@@ -140,12 +174,17 @@ class SocHarness(p: OoOParams = OoOParams()) extends Module {
     // ---- framebuffer capture ----
     // Mirror every framebuffer write (Memory routes those out on write_vga, addressed relative to
     // the fb base) into a capture RAM, and count them so a run can report rendering progress.
-    val fbMem    = SyncReadMem(p.fbWords, UInt(32.W))
+    //
+    // The capture RAM is a `Mem` (COMBINATIONAL read), not a SyncReadMem, on purpose: the testbench
+    // scans it out one pixel at a time, and a combinational read lets it read a pixel with just
+    // poke-address + peek -- no clock step. That means the readout does NOT advance the CPU, so a
+    // frame can be captured without pausing Doom and without it overwriting the frame mid-scan.
+    val fbMem    = Mem(p.fbWords, UInt(32.W))
     val fbWrites = RegInit(0.U(64.W))
     when(memory.io.write_vga && (memory.io.address_vga < p.fbWords.U)) {
         fbMem.write(memory.io.address_vga, memory.io.write_value_vga)
         fbWrites := fbWrites + 1.U
     }
-    io.fb_read_data := fbMem.read(io.fb_read_addr)
+    io.fb_read_data := fbMem.read(io.fb_read_addr) // combinational
     io.fb_writes    := fbWrites
 }

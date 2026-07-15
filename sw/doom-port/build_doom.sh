@@ -53,6 +53,17 @@ sed -i 's/strcmp("doom1.wad", path)/(strcmp("doom1.wad", path) \&\& strcmp("free
 # Use picolibc's crt0 for startup, not the port's hand-rolled _start: rename the port symbol so
 # it becomes dead code (gc-sectioned away) and does not clash with crt0's _start.
 sed -i 's/void _start(void)/void _port_start_unused(void)/' doomgeneric_rvdoom.c
+# Replace the stdio WAD backend with the memory-direct one (reads the embedded doom1_wad array
+# directly instead of through FILE*/fread, which on picolibc is byte-at-a-time buffered stdio).
+if [ -f w_file_mem.c ]; then cp w_file_mem.c w_file_stdc.c; fi
+
+# Make the memory-mapped I/O accesses VOLATILE. The port dereferences the timer (0x8000004) and
+# framebuffer (0x10000000) through plain (non-volatile) pointers. At -O0 (which the upstream build
+# used) that happens to work; at -O2 (which we use for speed) the compiler hoists the loop-invariant
+# timer read out of DG_SleepMs's wait loop -- turning it into an infinite loop -- and may dead-store-
+# eliminate the framebuffer writes. Forcing volatile fixes both.
+sed -i 's/(uint32_t\*)0x8000004/(volatile uint32_t*)0x8000004/g'   doomgeneric_rvdoom.c
+sed -i 's/(uint32_t\*)0x10000000/(volatile uint32_t*)0x10000000/g' doomgeneric_rvdoom.c
 
 # --- source list: the rvdoom object set from the upstream Makefile, minus dummy platform files -
 SRCS=$(grep -oE '[a-z0-9_]+\.o' Makefile | sed 's/\.o$/.c/' | sort -u)
