@@ -1,0 +1,10 @@
+# GitHub Linguist overrides.
+#
+# doom-gameplay/ holds generated capture assets: a ~2 MB HTML player with 58 base64-embedded
+# frames, plus the frames and an MP4. Without this, Linguist counts the big HTML file as ~89%
+# of the repo's bytes and reports HTML as the primary language, burying the actual Scala/Chisel
+# source. Marking it generated excludes it from language stats and collapses its diffs.
+doom-gameplay/** linguist-generated=true
+
+# The committed compiled-C test images are data inputs, not source.
+sw/build/*.hex linguist-generated=true
