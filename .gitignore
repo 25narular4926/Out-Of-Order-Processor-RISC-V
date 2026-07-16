@@ -50,6 +50,10 @@ project/target/
 *.iml
 .vscode/
 
+### Local-only (not vendored)
+# Project guide for Claude Code; kept local rather than committed.
+CLAUDE.md
+
 ### OS
 .DS_Store
 Thumbs.db
