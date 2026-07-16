@@ -24,6 +24,25 @@ OBJDUMP=riscv64-unknown-elf-objdump
 OUT=build
 mkdir -p "$OUT"
 
+# --- WAD selection --------------------------------------------------------------------------
+# Embed exactly one WAD, chosen by the WAD env var (default freedm.wad). Keep multiple WADs on
+# disk and switch with e.g.  WAD=doom1.wad ./build_doom.sh  -- no renames or deletes needed.
+# WAD may be a bare filename (looked up here and in ../../wad) or an absolute/relative path.
+WAD="${WAD:-freedm.wad}"
+resolve_wad() {
+  for c in "$WAD" "$HERE/$WAD" "$HERE/../../wad/$WAD"; do
+    if [ -f "$c" ]; then echo "$c"; return 0; fi
+  done
+  # also search recursively under ../../wad (release zips extract into subdirs)
+  local found
+  found="$(find "$HERE/../../wad" -name "$(basename "$WAD")" 2>/dev/null | head -1)"
+  [ -n "$found" ] && { echo "$found"; return 0; }
+  return 1
+}
+WAD_PATH="$(resolve_wad)" || { echo "!! WAD '$WAD' not found (looked in ., $HERE, ../../wad)"; exit 1; }
+cp "$WAD_PATH" "$HERE/game.wad"
+printf ">> WAD: %s (%.1f MB) -> game.wad\n" "$WAD_PATH" "$(echo "$(stat -c%s "$WAD_PATH")/1048576" | bc -l)"
+
 # picolibc supplies the C library (stdio/stdlib/string), its own crt0 (_start: sets the stack,
 # initialises TLS -- picolibc keeps errno in TLS -- copies .data, zeroes .bss, calls main), and
 # its own linker script picolibc.ld. We let it own all of that instead of the port's hand-rolled

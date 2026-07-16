@@ -21,6 +21,11 @@ class SocHarness(p: OoOParams = OoOParams()) extends Module {
         val flash_address = Input(UInt(32.W))
         val flash_value   = Input(UInt(32.W))
         val btns          = Input(UInt(4.W))
+        // Full keyboard bitmap for scripted input. Doom's DG_GetKey reads KEYTRACKER (0x08000008)
+        // and maps set bits to HID codes (bit i in the word at offset w => HID w*32+i). Memory
+        // returns this same value for every key word, so bit i triggers HID {i, 32+i, ... 224+i};
+        // pick bits whose only mapped HID is the intended key (e.g. bit 8 => HID 0x28 = Enter).
+        val key_bits      = Input(UInt(32.W))
 
         // tohost mailbox (Memory's MMIO write port)
         val tohost_valid = Output(Bool())
@@ -78,7 +83,7 @@ class SocHarness(p: OoOParams = OoOParams()) extends Module {
     val core   = Module(new Core(p))
 
     core.io.execute := io.execute
-    memory.io.keys  := io.btns
+    memory.io.keys  := io.btns | io.key_bits
 
     // instruction fetch (byte address -> word address)
     memory.io.read_1        := true.B

@@ -81,7 +81,36 @@ class DoomSpec extends AnyFreeSpec with Matchers with ChiselSim {
             dut.io.flash_value.poke(0.U)
             dut.io.fb_read_addr.poke(0.U)
             dut.io.pc_range_reset.poke(false.B)
+            dut.io.key_bits.poke(0.U)
             dut.io.execute.poke(true.B)
+
+            // SCRIPTED INPUT: navigate the menu into an actual game, then move.
+            //
+            // Doom advances game-time one tic per rendered frame, and the input responder runs each
+            // frame. A key is "held" (Doom sees a keydown edge, then movement/selection continues)
+            // while its bit is set in the harness key bitmap (Memory returns that value for every
+            // KEYTRACKER word, so bit i triggers HID {i,32+i,...}; pick bits whose only mapped HID
+            // is the intended key). Bits used:
+            //   ENTER   = bit 8  (HID 0x28)  -> menu select / advance
+            //   FORWARD = bit 26 (HID 0x1A = W = KEY_UPARROW) -> walk forward
+            // Sequence for shareware DOOM: Enter opens the main menu (New Game highlighted), then
+            // Enter -> New Game -> Episode (E1) -> Skill -> in game. Extra Enters in-game are
+            // harmless (Enter isn't a game action). Then hold FORWARD so the player runs and the
+            // view actually animates (walls/floor scroll). Each menu press is held a few frames so
+            // DG_GetKey (once per frame) samples the keydown, then released so the next press edges.
+            val ENTER   = BigInt(1) << 8
+            val FORWARD = BigInt(1) << 26
+            // (startFrame inclusive, endFrame exclusive, keyBits) — frames counted by completed
+            // framebuffers. Overridable via -Ddoom.moveFromFrame for when gameplay begins.
+            val moveFrom = sys.props.getOrElse("doom.moveFromFrame", "30").toInt
+            def scheduledKeys(frame: Int): BigInt =
+                if      (frame >= 3  && frame < 6)  ENTER    // open main menu
+                else if (frame >= 10 && frame < 13) ENTER    // New Game
+                else if (frame >= 17 && frame < 20) ENTER    // Episode (E1)
+                else if (frame >= 24 && frame < 27) ENTER    // Skill -> start game
+                else if (frame >= moveFrom)         FORWARD  // in game: walk forward
+                else                                BigInt(0)
+            var lastKey = BigInt(-1)
 
             println(s"[DOOM] running up to $maxCycles cycles; console output follows:")
             println("----------------------------------------------------------------")
@@ -113,9 +142,19 @@ class DoomSpec extends AnyFreeSpec with Matchers with ChiselSim {
                 dut.clock.step(capBatch)
                 stepped += capBatch
                 val fbw = dut.io.fb_writes.peek().litValue
+                val frameNo = (fbw / fbWords).toInt
                 if (fbw != lastFbWrites) {
-                    println(f"\n[DOOM] framebuffer writes so far: $fbw%,d (${fbw / fbWords} full frames)")
+                    println(f"\n[DOOM] framebuffer writes so far: $fbw%,d ($frameNo full frames)")
                     lastFbWrites = fbw
+                }
+                // scripted input: drive the key bitmap from the schedule (only poke on change so
+                // DG_GetKey sees clean press/release edges).
+                val want = scheduledKeys(frameNo)
+                if (want != lastKey) {
+                    dut.io.key_bits.poke(want.U)
+                    val name = if (want == ENTER) "ENTER" else if (want == FORWARD) "FORWARD" else "release"
+                    println(s"[DOOM] >>> input @ frame $frameNo: $name")
+                    lastKey = want
                 }
                 // capture a sequence of frames as they complete
                 if (captureFrames > 0 && framesDumped < captureFrames) {
